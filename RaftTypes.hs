@@ -9,9 +9,10 @@ import Data.Map as Map
 import GHC.Generics
 import Control.Lens
 import Data.Aeson
+import Control.Monad.State
 import Control.Monad
 
-data Role = Leader | Follower | Candidate
+data Role = Booting | Leader | Follower | Candidate
 
 newtype MessageId = MessageId Integer
                   deriving (Eq, Ord, Show, Num, Enum, Generic)
@@ -22,10 +23,24 @@ newtype ServerId = ServerId Integer
 newtype LogIndex = LogIndex Integer
                  deriving (Eq, Ord, Show, Num, Enum, Generic)
 
-data LogEntry a = LogEntry Term a
-                  deriving (Show, Generic)
+data LogEntry a = LogEntry {
+  _entryTerm :: Term,
+  _entryData :: a
+  } deriving (Show, Generic)
+makeLenses ''LogEntry
 
-type Log a = [LogEntry a]
+type IndexedEntry a = (LogIndex, LogEntry a)
+
+data Log a = Log {
+  _logEntries :: [LogEntry a]
+  } deriving (Show, Generic)
+makeLenses ''Log
+
+logMap :: ([LogEntry a] -> [LogEntry b]) -> Log a -> Log b
+logMap f (Log as) = Log (f as)
+
+entry :: LogIndex -> Log a -> Maybe (LogEntry a)
+entry (LogIndex nth) (Log es) = es ^? element (fromIntegral nth - 1)
 
 instance ToJSON Term
 instance FromJSON Term
@@ -35,11 +50,13 @@ instance ToJSON LogIndex
 instance FromJSON LogIndex
 instance ToJSON a => ToJSON (LogEntry a)
 instance FromJSON a => FromJSON (LogEntry a)
--- instance ToJSON a => ToJSON (Log a)
--- instance FromJSON a => FromJSON (Log a)
+instance ToJSON a => ToJSON (Log a)
+instance FromJSON a => FromJSON (Log a)
 
 type ServerMap a = Map ServerId a
 data ServerConfig s c e = ServerConfig {
+  _serverId :: ServerId,
+  _role :: Role,
   _cohorts :: ServerMap c,
   _storage :: s e
   }
@@ -80,6 +97,8 @@ persist serv = writeToStable (extractPersistentState serv) $ view (config.storag
 
 fromPersist :: (Persist s, FromJSON e) => Server s c e -> IO (Server s c e)
 fromPersist serv = readFromStable (view (config.storage) serv) >>= return . injectPersistentState serv
+
+type Raft s c a v = State (Server s c a) v
 
 -- main :: IO()
 -- main = do

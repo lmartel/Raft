@@ -21,40 +21,23 @@ data MessageType = AppendEntries | AppendEntriesResponse
                  | RequestVote | RequestVoteResponse
                  deriving Show
 
+data MessageInfo = MessageInfo {
+  _msgFrom :: ServerId,
+  _msgId :: MessageId
+  } deriving Show
+makeLenses ''MessageInfo
+
 data Message = Message {
   _msgType :: MessageType,
-  _msgArgs :: [(String, ByteString)]
+  _msgArgs :: [(String, ByteString)],
+  _msgInfo :: MessageInfo
   } deriving Show
 makeLenses ''Message
 
-data RPC a = Request MessageId a | Response MessageId a
-           | NextRequest a | NextResponse a
-           deriving (Functor, Show)
+info :: Lens' Message MessageInfo
+info = msgInfo
 
-payload :: RPC a -> a
-payload (Request _ a) = a
-payload (Response _ a) = a
-payload (NextRequest a) = a
-payload (NextResponse a) = a
-
-rpcType :: RPC Message -> MessageType
-rpcType = view msgType . payload
-
-instance Applicative RPC where
-  pure = Request 1
-  (<*>) = ap
-
-pipeRPC :: MessageId -> a -> (a -> RPC b) -> RPC b
-pipeRPC mid a amb = case amb a of
-                  (Request _ b) -> Request (1 + mid) b
-                  (NextRequest b) -> Request (1 + mid) b
-                  (Response _ b) -> Response mid b
-                  (NextResponse b) -> Response mid b
-
-instance Monad RPC where
-     (Request i x) >>= fn = pipeRPC i x fn
-     (Response i x) >>= fn = pipeRPC i x fn
-
+type BaseMessage = MessageInfo -> Message
 
 
 extract :: FromJSON a => String -> Message -> Maybe a
@@ -102,7 +85,8 @@ lastLogTerm = extract kLastLogTerm
 voteGranted :: Message -> Maybe Bool
 voteGranted = extract kVoteGranted
 
-appendEntries :: ToJSON e => Term -> ServerId -> LogIndex -> Term -> [(LogIndex, LogEntry e)] -> LogIndex -> Message
+
+appendEntries :: ToJSON e => Term -> ServerId -> LogIndex -> Term -> [(LogIndex, LogEntry e)] -> LogIndex -> BaseMessage
 appendEntries t lid pli plt es lc = Message AppendEntries [
   (kTerm, encode t),
   (kLeaderId, encode lid),
@@ -112,13 +96,13 @@ appendEntries t lid pli plt es lc = Message AppendEntries [
   (kLeaderCommit, encode lc)
   ]
 
-appendEntriesResponse :: Term -> Bool -> Message
+appendEntriesResponse :: Term -> Bool -> BaseMessage
 appendEntriesResponse t s = Message AppendEntriesResponse [
   (kTerm, encode t),
   (kSuccess, encode s)
   ]
 
-requestVote :: Term -> ServerId -> LogIndex -> Term -> Message
+requestVote :: Term -> ServerId -> LogIndex -> Term -> BaseMessage
 requestVote t cid lli llt = Message RequestVote [
   (kTerm, encode t),
   (kCandidateId, encode cid),
@@ -126,7 +110,7 @@ requestVote t cid lli llt = Message RequestVote [
   (kLastLogTerm, encode llt)
   ]
 
-requestVoteResponse :: Term -> Bool -> Message
+requestVoteResponse :: Term -> Bool -> BaseMessage
 requestVoteResponse t vg = Message RequestVoteResponse [
   (kTerm, encode t),
   (kVoteGranted, encode vg)
