@@ -5,14 +5,17 @@
 module RaftTypes where
 import qualified Prelude (log)
 import Prelude hiding (log)
-import Data.Map as Map
+import Data.Map (Map)
+import qualified Data.Map as Map
 import GHC.Generics
 import Control.Lens
 import Data.Aeson
 import Control.Monad.State
 import Control.Monad
+import Data.ByteString.Lazy.Internal (ByteString)
 
 data Role = Booting | Leader | Follower | Candidate
+          deriving (Eq, Show)
 
 newtype MessageId = MessageId Integer
                   deriving (Eq, Ord, Show, Num, Enum, Generic)
@@ -22,6 +25,9 @@ newtype ServerId = ServerId Integer
                  deriving (Eq, Ord, Show, Num, Enum, Generic)
 newtype LogIndex = LogIndex Integer
                  deriving (Eq, Ord, Show, Num, Enum, Generic)
+
+type Hostname = String
+type Port = Int
 
 data LogEntry a = LogEntry {
   _entryTerm :: Term,
@@ -53,7 +59,50 @@ instance FromJSON a => FromJSON (LogEntry a)
 instance ToJSON a => ToJSON (Log a)
 instance FromJSON a => FromJSON (Log a)
 
-type ServerMap a = Map ServerId a
+data NilEntry = NilEntry
+instance FromJSON NilEntry where
+  parseJSON _ = return NilEntry
+
+--- Message types
+
+data MessageType = AppendEntries | AppendEntriesResponse
+                 | RequestVote | RequestVoteResponse
+                 deriving Show
+
+data MessageInfo = MessageInfo {
+  _msgFrom :: ServerId,
+  _msgId :: MessageId
+  } deriving Show
+makeLenses ''MessageInfo
+
+data Message = Message {
+  _msgType :: MessageType,
+  _msgArgs :: [(String, ByteString)],
+  _msgInfo :: MessageInfo
+  } deriving Show
+makeLenses ''Message
+
+info :: Lens' Message MessageInfo
+info = msgInfo
+
+type BaseMessage = MessageInfo -> Message
+type PendingMessage c = (c, Message)
+
+--- Storage types
+
+type PersistentState a = (Term, Maybe ServerId, Log a)
+
+
+class Persist s where
+  writeToStable :: ToJSON a => PersistentState a -> s a -> IO ()
+  readFromStable :: FromJSON a => s a -> IO (PersistentState a)
+
+  fromName :: String -> s a
+
+--- Server type
+
+
+type ServerMap a = Map.Map ServerId a
 data ServerConfig s c e = ServerConfig {
   _serverId :: ServerId,
   _role :: Role,
@@ -75,32 +124,60 @@ data Server s c e = Server {
   _matchIndex :: Maybe (ServerMap LogIndex),
 
   --- Non-raft state
-  _config :: ServerConfig s c e
+  _config :: ServerConfig s c e,
+  _outstanding :: Map MessageId (PendingMessage c)
   }
 makeLenses ''Server
 
+instance (Show e) => Show (Server s c e) where
+  show s = "=== Server " ++ show (view (config.serverId) s) ++ " state ===" ++ "\n"
+           ++ "currentTerm: " ++ show (view currentTerm s) ++ "\n"
+           ++ "votedFor: " ++ show (view votedFor s) ++ "\n"
+           ++ "log: " ++ show (view log s) ++ "\n"
+           ++ "commitIndex: " ++ show (view commitIndex s) ++ "\n"
+           ++ "lastApplied: " ++ show (view lastApplied s) ++ "\n"
+           ++ "nextIndex: " ++ showM (view nextIndex s) ++ "\n"
+           ++ "matchIndex: " ++ showM (view matchIndex s) ++ "\n"
+           ++ "=== end ==="
+    where showM Nothing = "___"
+          showM (Just x) = show x
 
-type PersistentState a = (Term, Maybe ServerId, Log a)
 
-injectPersistentState :: Server s c e -> PersistentState e -> Server s c e
-injectPersistentState serv (t, v, l) = set currentTerm t . set votedFor v . set log l $ serv
+type Raft s c a v = State (Server s c a) v
+
+
+--- Accessors and helpers
+
+-- State accessors
+lastIndex :: Log a -> LogIndex
+lastIndex = LogIndex . fromIntegral . length . view logEntries
+
+viewLastLogIndex :: Server s c a -> LogIndex
+viewLastLogIndex = lastIndex . view log
+
+withIndices :: Log a -> [(LogIndex, LogEntry a)]
+withIndices = zip [1..] . view logEntries
+
+logWithIndices :: Server s c a -> [(LogIndex, LogEntry a)]
+logWithIndices = withIndices . view log
+
+serverCohorts :: Server s c a -> [c]
+serverCohorts = map snd . Map.toList . view (config.cohorts)
+
+termAtIndex :: LogIndex -> Server s c a -> Maybe Term
+termAtIndex 0 _ = Just 0
+termAtIndex i s = entry i (view log s) >>= Just . view entryTerm
+
+
+-- Storage helpers
+injectPersistentState :: PersistentState e -> Server s c e  -> Server s c e
+injectPersistentState (t, v, l) serv = set currentTerm t . set votedFor v . set log l $ serv
 
 extractPersistentState :: Server s c e -> PersistentState e
 extractPersistentState serv = (view currentTerm serv, view votedFor serv, view log serv)
-
-class Persist s where
-  writeToStable :: ToJSON a => PersistentState a -> s a -> IO ()
-  readFromStable :: FromJSON a => s a -> IO (PersistentState a)
 
 persist :: (Persist s, ToJSON e) => Server s c e -> IO ()
 persist serv = writeToStable (extractPersistentState serv) $ view (config.storage) serv
 
 fromPersist :: (Persist s, FromJSON e) => Server s c e -> IO (Server s c e)
-fromPersist serv = readFromStable (view (config.storage) serv) >>= return . injectPersistentState serv
-
-type Raft s c a v = State (Server s c a) v
-
--- main :: IO()
--- main = do
---   let r = AppendEntriesResult 0 True
---   print $ view aer_term r
+fromPersist serv = readFromStable (view (config.storage) serv) >>= return . flip injectPersistentState serv

@@ -1,23 +1,12 @@
-{-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 module ConnectionTypes where
 import Control.Lens
-import GHC.Generics
+import Data.IORef
 import Data.Aeson
 
 import RaftTypes
 import MessageTypes
-
-type Hostname = String
-type Port = Int
-
-data ClusterConfig = ClusterConfig {
-  _leader :: ServerId,
-  _servers :: [(ServerId, Hostname, Port)]
-  } deriving (Show, Generic)
-makeLenses ''ClusterConfig
-instance ToJSON ClusterConfig
-instance FromJSON ClusterConfig
+import Config
 
 class Connection c where
   request :: Message -> c -> IO (Maybe Message)
@@ -30,7 +19,17 @@ class Connection c where
                                                 (Just msg) -> return msg
                                      )
 
-  fromHostPort :: Hostname -> Port -> c
+  fromConfig :: CohortConfig -> IO c
+
+data NilConnection = NilConnection
+
+instance Connection NilConnection where
+  request _ _ = return Nothing
+  respond _ _ = return ()
+
+  listenMaybe _ = return Nothing
+  listen = error "NilConnection.listen :: listening on a NilConnection will hang"
+  fromConfig _ = return NilConnection
 
 data FakeConnection = FakeConnection | FakePartition
                     deriving Show
@@ -48,16 +47,8 @@ instance Connection FakeConnection where
     where newEntries = zip [1..] [LogEntry 19 "first log entry", LogEntry 20 "second log entry"]
           me = MessageInfo 1 1337
 
-  fromHostPort _ _ = FakeConnection
+  fromConfig _ = return FakeConnection
 
--- data SelfConnection = SelfConnection (Message -> Message)
-
--- instance Connection SelfConnection where
---   request msg (SelfConnection handler) = return . Just . handler $ msg
---   respond _ _ = return ()
-
-
-data SelfConnection s c a = SelfConnection (Server s c a)
-
-instance Connection (SelfConnection s c a) where
-  request msg (SelfConnection s2) =
+-- TODO get updates from the client somehow
+class ClientConnection c a where
+  getUpdate :: c a -> IO a

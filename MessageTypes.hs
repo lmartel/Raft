@@ -1,7 +1,3 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE DeriveFunctor #-}
-{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 module MessageTypes where
@@ -16,29 +12,6 @@ import Data.List
 import Data.ByteString.Lazy.Internal (ByteString)
 
 import RaftTypes
-
-data MessageType = AppendEntries | AppendEntriesResponse
-                 | RequestVote | RequestVoteResponse
-                 deriving Show
-
-data MessageInfo = MessageInfo {
-  _msgFrom :: ServerId,
-  _msgId :: MessageId
-  } deriving Show
-makeLenses ''MessageInfo
-
-data Message = Message {
-  _msgType :: MessageType,
-  _msgArgs :: [(String, ByteString)],
-  _msgInfo :: MessageInfo
-  } deriving Show
-makeLenses ''Message
-
-info :: Lens' Message MessageInfo
-info = msgInfo
-
-type BaseMessage = MessageInfo -> Message
-
 
 extract :: FromJSON a => String -> Message -> Maybe a
 extract name msg = find (\(s, _) -> s == name) (view msgArgs msg) >>= (decode . snd)
@@ -85,8 +58,22 @@ lastLogTerm = extract kLastLogTerm
 voteGranted :: Message -> Maybe Bool
 voteGranted = extract kVoteGranted
 
+heartbeatFromLeader :: ToJSON a => Server s c a -> BaseMessage
+heartbeatFromLeader = flip appendEntriesFromLeader []
 
-appendEntries :: ToJSON e => Term -> ServerId -> LogIndex -> Term -> [(LogIndex, LogEntry e)] -> LogIndex -> BaseMessage
+appendEntriesFromLeader :: ToJSON a => Server s c a -> [(LogIndex, LogEntry a)] -> BaseMessage
+appendEntriesFromLeader s es = appendEntries (view currentTerm s) (view (config.serverId) s) findPrevLogIndex findPrevLogTerm es (view commitIndex s)
+  where findPrevLogTerm :: Term
+        findPrevLogTerm = case termAtIndex findPrevLogIndex s of
+                           Nothing -> error "appendEntriesFromLeader :: gap in log!"
+                           (Just t) -> t
+
+        findPrevLogIndex :: LogIndex
+        findPrevLogIndex = case es of
+          [] -> viewLastLogIndex s
+          (e:_) -> fst e - 1
+
+appendEntries :: ToJSON a => Term -> ServerId -> LogIndex -> Term -> [(LogIndex, LogEntry a)] -> LogIndex -> BaseMessage
 appendEntries t lid pli plt es lc = Message AppendEntries [
   (kTerm, encode t),
   (kLeaderId, encode lid),

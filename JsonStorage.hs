@@ -20,6 +20,7 @@ instance FromJSON a => FromJSON (PersistentState a)
 instance Persist JsonStorage where
   writeToStable = writeToJson
   readFromStable = readFromJson
+  fromName = JsonStorage
 
 writeToJson :: ToJSON a => PersistentState a -> JsonStorage a -> IO ()
 writeToJson state stor = B.writeFile (filename stor) (encode state)
