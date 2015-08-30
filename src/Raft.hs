@@ -225,10 +225,15 @@ validateAppendEntries serv msg =  case Just . all (== True) =<< sequence [
 
 --- Startup and main
 
+kConfigDir :: String
+kConfigDir = "db/"
 kConfigFile :: String
-kConfigFile = "config.json"
+kConfigFile = kConfigDir ++ "config.json"
+
+kLogDir :: String
+kLogDir = kConfigDir
 kLogFile :: String
-kLogFile = "log.json"
+kLogFile = kLogDir ++ "log.json"
 
 configureCohorts :: Connection c => ClusterConfig -> IO (ServerMap c)
 configureCohorts conf = liftM Map.fromList $ pure conf
@@ -287,8 +292,8 @@ singleThreadedLeaderMain :: IO ()
 singleThreadedLeaderMain = undefined
 
 
-main :: IO ()
-main = do
+raftMain :: IO ()
+raftMain = do
   args <- getArgs
   (case args of
    (myId:"test":_) -> testMain . fromIntegral $ read myId
@@ -328,7 +333,7 @@ instance (ToJSON a, FromJSON a, Persist s) => Connection (SelfConnection s c a) 
     mid <- newIORef 0
     serv <- newIORef . initializeFollower $ ServerConfig sid Follower Map.empty (fromName storageName)
     return $ SelfConnection serv mid
-    where storageName = host ++ "_" ++ show port ++ ".local.json"
+    where storageName = kConfigDir ++ host ++ "_" ++ show port ++ ".local.json"
 
 -- TODO get rid of this
 instance Show a => Show (SelfConnection s c a) where
@@ -360,11 +365,11 @@ testWriteConfig = do
       Config.CohortConfig 3 "localhost" 3003
       ]
     }
-  ByteString.writeFile "config.auto.json" (encode conf)
+  ByteString.writeFile kConfigFile (encode conf)
 
 testReadConfig :: IO ()
 testReadConfig = do
-  c <- ByteString.readFile "config.json" >>= return . decode :: IO (Maybe ClusterConfig)
+  c <- ByteString.readFile kConfigFile >>= return . decode :: IO (Maybe ClusterConfig)
   case c of
    Nothing -> putStrLn "Failed to parse"
    (Just c) -> print c
@@ -386,7 +391,7 @@ testManual = do
   print resp
   print (view log me'')
   print "Done."
-    where fakeConf = ServerConfig 0 Booting followers (JsonStorage "test.json")
+    where fakeConf = ServerConfig 0 Booting followers (JsonStorage $ kLogDir ++ "test.json")
           followers = Map.fromList [
             (1, FakeConnection),
             (2, FakePartition),
