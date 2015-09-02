@@ -17,6 +17,8 @@ import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.ByteString.Lazy as ByteString
 
+import Test.HUnit
+
 import RaftTypes
 import MessageTypes
 import ConnectionTypes
@@ -225,10 +227,15 @@ validateAppendEntries serv msg =  case Just . all (== True) =<< sequence [
 
 --- Startup and main
 
+kConfigDir :: String
+kConfigDir = "db/"
 kConfigFile :: String
-kConfigFile = "config.json"
+kConfigFile = kConfigDir ++ "config.json"
+
+kLogDir :: String
+kLogDir = kConfigDir
 kLogFile :: String
-kLogFile = "log.json"
+kLogFile = kLogDir ++ "log.json"
 
 configureCohorts :: Connection c => ClusterConfig -> IO (ServerMap c)
 configureCohorts conf = liftM Map.fromList $ pure conf
@@ -259,10 +266,21 @@ serverMain myId = undefined
 singleThreadedFollowerMain :: Connection c => ServerConfig s c a -> IO ()
 singleThreadedFollowerMain = undefined
 
-followerMain :: Connection c => ServerConfig s c a -> IO ()
-followerMain = undefined
+followerMain :: Connection c => ServerConfig s c a -> IO (Server s c a)
+followerMain conf = do
+  let nCohorts = Map.size . view cohorts $ conf
+  -- create socket
+  sock <- socket AF_INET Stream 0
+  -- make socket immediately reusable - eases debugging.
+  setSocketOption sock ReuseAddr 1
+  -- listen on TCP port
+  bindSocket sock (SockAddrInet (fromIntegral port) iNADDR_ANY)
+  -- allow a maximum of (#COHORTS) outstanding connections
+  Sock.listen sock nCohorts
+  replicate nCohorts (accept sock)
 
-leaderMain :: (Connection c, ToJSON a, FromJSON a, Show a) => PersistentState a -> ServerConfig s c a -> IO ()
+
+leaderMain :: (Connection c, ToJSON a, FromJSON a, Show a) => PersistentState a -> ServerConfig s c a -> IO (Server s c a)
 leaderMain stableState@(_, _, startingLog) conf = do
   nextMessageId <- newIORef 0
 
@@ -280,23 +298,56 @@ leaderMain stableState@(_, _, startingLog) conf = do
   putStrLn "===== LEADER FINISHED ====="
   print serv'
   putStrLn "leaderMain done."
+  return serv'
   where majoritySuccessful :: [Message] -> Bool
         majoritySuccessful resps = True -- (\resps -> length (filter wasSuccessful resps) > nCohorts / 2)
 
 singleThreadedLeaderMain :: IO ()
 singleThreadedLeaderMain = undefined
 
-
 main :: IO ()
 main = do
   args <- getArgs
   (case args of
-   (myId:"test":_) -> testMain . fromIntegral $ read myId
-   (myId:_) -> serverMain . fromIntegral $ read myId
+   (myId:"test":_) -> testMain . fromIntegral . read $ myId
+   (myId:_) -> serverMain . fromIntegral . read $ myId
    _ -> error "Invalid arguments." -- TODO fancier arg parsing / flags
    )
 
 -- Testing and testing utils
+
+testMain :: ServerId -> IO ()
+testMain myId = do
+  ioConfig <- writeTestConfig simpleConfig >> readTestConfig
+
+  appendLdr <- testLocalSystemWith (Log [LogEntry 1 "stardate one"]) myId
+  appendLogs <- followerLogs appendLdr
+
+  -- hbeatLdr <- testLocalSystemWith (Log []) myId
+  -- hbeatLogs <- followerLogs hbeatLdr
+
+  runTestTT . TestList $ [
+        TestLabel "testConfig"
+        . TestCase $ assertEqual "for write >> read config," (Just simpleConfig)
+        ioConfig
+        ,
+        TestLabel "testSimpleAppendResponses"
+        . TestCase $ assertEqual ("for matchIndices @ testLocalSystem " ++ show myId ++ ",") (Just [1,1,1])
+        (liftM (map snd . Map.toList) $ view matchIndex appendLdr)
+        ,
+        TestLabel "testSimpleAppendStorage"
+        . TestCase $ assertAllEqual ("for follower logs @ testLocalSystem " ++ show myId ++ ",") (view log appendLdr)
+        appendLogs
+        ]
+
+  print "All done!"
+    where third (_, _, x) = x
+          followerLogs ldr = do
+              followerStorages <- mapM (selfConnectionStorage . snd) . Map.toList . view (config.cohorts) $ ldr
+              mapM (fmap third . readFromStable) followerStorages
+
+assertAllEqual :: (Eq a, Show a) => String -> a -> [a] -> Assertion
+assertAllEqual msg expected = mapM_ (assertEqual msg expected)
 
 {-# NOINLINE debug #-}
 debug :: String -> a -> a
@@ -308,6 +359,9 @@ debug' :: Show a => a -> a
 debug' dat = unsafePerformIO (print dat) `seq` dat
 
 data SelfConnection s c a = SelfConnection (IORef (Server s c a)) (IORef MessageId)
+
+selfConnectionStorage :: SelfConnection s c a -> IO (s a)
+selfConnectionStorage (SelfConnection servRef _) = view (config.storage) <$> readIORef servRef
 
 instance (ToJSON a, FromJSON a, Persist s) => Connection (SelfConnection s c a) where
   request req (SelfConnection servRef _) = do
@@ -328,31 +382,14 @@ instance (ToJSON a, FromJSON a, Persist s) => Connection (SelfConnection s c a) 
     mid <- newIORef 0
     serv <- newIORef . initializeFollower $ ServerConfig sid Follower Map.empty (fromName storageName)
     return $ SelfConnection serv mid
-    where storageName = host ++ "_" ++ show port ++ ".local.json"
+    where storageName = kLogDir ++ host ++ "_" ++ show port ++ ".local.json"
 
 -- TODO get rid of this
 instance Show a => Show (SelfConnection s c a) where
          show (SelfConnection servRef _) = show . unsafePerformIO . readIORef $ servRef
 
-testMain :: ServerId -> IO ()
-testMain myId = do
-  -- testWriteConfig
-  testReadConfig
-  -- testManual
-  testLocalSystem myId
-
-  print "All done!"
-
-testLocalSystem :: ServerId -> IO ()
-testLocalSystem myId = do
-  conf <- readJSONConfig kConfigFile myId :: IO (ServerConfig JsonStorage (SelfConnection JsonStorage NilConnection String) String)
-  case view role conf of
-   Leader -> leaderMain (1, Just myId, Log [LogEntry 1 "stardate one"]) conf
-   Follower -> followerMain conf
-
-testWriteConfig :: IO ()
-testWriteConfig = do
-  let conf = Config.ClusterConfig {
+simpleConfig :: ClusterConfig
+simpleConfig = Config.ClusterConfig {
     Config.leader = 1,
     Config.servers = [
       Config.CohortConfig 1 "localhost" 3001,
@@ -360,15 +397,20 @@ testWriteConfig = do
       Config.CohortConfig 3 "localhost" 3003
       ]
     }
-  ByteString.writeFile "config.auto.json" (encode conf)
 
-testReadConfig :: IO ()
-testReadConfig = do
-  c <- ByteString.readFile "config.json" >>= return . decode :: IO (Maybe ClusterConfig)
-  case c of
-   Nothing -> putStrLn "Failed to parse"
-   (Just c) -> print c
+testLocalSystemWith :: Log String -> ServerId -> IO (Server JsonStorage (SelfConnection JsonStorage NilConnection String) String)
+testLocalSystemWith lg myId = do
+  conf <- readJSONConfig kConfigFile myId
+  case view role conf of
+   Leader -> leaderMain (1, Just myId, lg) conf
+   Follower -> followerMain conf
 
+
+writeTestConfig :: ClusterConfig -> IO ()
+writeTestConfig = ByteString.writeFile (kConfigDir ++ "config.auto.json") . encode
+
+readTestConfig :: IO (Maybe ClusterConfig)
+readTestConfig = decode <$> ByteString.readFile kConfigFile
 
 testManual :: IO ()
 testManual = do
@@ -386,7 +428,7 @@ testManual = do
   print resp
   print (view log me'')
   print "Done."
-    where fakeConf = ServerConfig 0 Booting followers (JsonStorage "test.json")
+    where fakeConf = ServerConfig 0 Booting followers (JsonStorage $ kLogDir ++ "test.json")
           followers = Map.fromList [
             (1, FakeConnection),
             (2, FakePartition),

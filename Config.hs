@@ -9,12 +9,12 @@ data CohortConfig = CohortConfig {
   id :: ServerId,
   hostname :: Hostname,
   port :: Port
-  } deriving (Show, Generic)
+  } deriving (Eq, Show, Generic)
 
 data ClusterConfig = ClusterConfig {
   leader :: ServerId,
   servers :: [CohortConfig]
-  } deriving (Show, Generic)
+  } deriving (Eq, Show, Generic)
 
 instance ToJSON CohortConfig
 instance FromJSON CohortConfig
