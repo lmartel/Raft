@@ -16,6 +16,9 @@ import System.IO.Unsafe
 import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.ByteString.Lazy as ByteString
+import qualified Network.Socket as Sock (listen)
+import Network.Socket hiding (listen)
+import System.IO
 
 import Test.HUnit
 
@@ -23,8 +26,7 @@ import RaftTypes
 import MessageTypes
 import ConnectionTypes
 import JsonStorage
-import Config (CohortConfig, ClusterConfig)
-import qualified Config
+import Config
 
 --- Initialization
 
@@ -52,15 +54,14 @@ promoteToLeader base = set (config.role) Leader . set nextIndex (Just nis) . set
 demoteToFollower :: Server s c a -> Server s c a
 demoteToFollower = set (config.role) Follower . set nextIndex Nothing . set matchIndex Nothing
 
-
 --- Sending/receiving messages
 
 requestInfo :: IORef MessageId -> Server s c a -> IO MessageInfo
 requestInfo midRef serv = readIORef midRef >>= writeNextMid
-  where writeNextMid mid = atomicWriteIORef midRef (mid + 1) >> return (MessageInfo (view (config.serverId) serv) mid)
+  where writeNextMid mid = atomicWriteIORef midRef (mid + 1) >> return (MessageInfo (view serverId serv) mid)
 
 responseInfo :: Message -> Server s c a -> MessageInfo
-responseInfo req serv = MessageInfo (view (config.serverId) serv) (view (info.msgId) req)
+responseInfo req serv = MessageInfo (view serverId serv) (view (info.msgId) req)
 
 prepareBroadcast :: IORef MessageId -> BaseMessage -> Server s c a -> IO [PendingMessage c]
 prepareBroadcast midRef msg serv
@@ -71,7 +72,7 @@ prepareBroadcast midRef msg serv
         nextMid :: [PendingMessage c] -> MessageId
         nextMid reqs = (1 + ) . last $ map (view (info.msgId) . snd) reqs
         requests mid1 = zipWith prepareMessage (serverCohorts serv) [mid1..]
-        prepareMessage c mid = (c, msg $ MessageInfo (view (config.serverId) serv) mid)
+        prepareMessage c mid = (c, msg $ MessageInfo (view serverId serv) mid)
 
 expectResponsesTo :: [PendingMessage c] -> Raft s c a ()
 expectResponsesTo msgs = get >>= put . over outstanding multiInsert
@@ -171,7 +172,6 @@ handleRequestVoteResponse :: Message -> Bool -> Raft s c a ()
 handleRequestVoteResponse = undefined
 -- retryIfNeeded ::
 
-
 processAppendEntries :: FromJSON a => Message -> Raft s c a Message
 processAppendEntries msg = do
   me <- get
@@ -239,21 +239,27 @@ kLogFile = kLogDir ++ "log.json"
 
 configureCohorts :: Connection c => ClusterConfig -> IO (ServerMap c)
 configureCohorts conf = liftM Map.fromList $ pure conf
-                        >>= connectAll . map (\conf@(Config.CohortConfig sid _ _) -> (sid, fromConfig conf)) . Config.servers
+                        >>= connectAll . map (\conf@(CohortConfig sid _ _) -> (sid, fromConfig conf)) . view clusterServers
                    where connectAll :: [(a, IO b)] -> IO [(a, b)]
                          connectAll connections = return . zip (map fst connections) =<< mapM snd connections
 
-configureSelf :: Connection c => ServerId -> ClusterConfig -> s a -> IO (ServerConfig s c a)
-configureSelf myId cluster stor = liftM (\clust' -> ServerConfig myId myRole clust' stor) (configureCohorts cluster)
-  where myRole = if myId == Config.leader cluster
+configureSelf :: Connection c => CohortConfig -> ClusterConfig -> s a -> IO (ServerConfig s c a)
+configureSelf myConf cluster stor = liftM (\clust' -> ServerConfig myRole myConf clust' stor) (configureCohorts cluster)
+  where myRole = if view cohortId myConf == view clusterLeader cluster
                  then Leader
                  else Follower
 
 -- TODO: generalize log entry type (use reflection?)
 readJSONConfig :: (Persist s, Connection c) => String -> ServerId -> IO (ServerConfig s c String)
-readJSONConfig f myId = ByteString.readFile f >>= \confStr -> case decode confStr of
-                              Nothing -> return . error $ "cannot read or parse config file: " ++ f
-                              (Just conf) -> configureSelf myId conf (fromName kLogFile)
+readJSONConfig f myId = do
+  confStr <- ByteString.readFile f
+  let maybeConf = decode confStr >>= (\clust -> liftM2 (,) (Just clust) (myConf clust))
+  case maybeConf of
+   Nothing -> return . error $ "cannot read or parse config file: " ++ f
+   (Just (me, clust)) -> configureSelf clust me (fromName kLogFile)
+
+  where myConf :: ClusterConfig -> Maybe CohortConfig
+        myConf = find (\someConf -> view cohortId someConf == myId) . view clusterServers
 
 serverMain :: ServerId -> IO ()
 serverMain myId = undefined
@@ -267,17 +273,18 @@ singleThreadedFollowerMain :: Connection c => ServerConfig s c a -> IO ()
 singleThreadedFollowerMain = undefined
 
 followerMain :: Connection c => ServerConfig s c a -> IO (Server s c a)
-followerMain conf = do
-  let nCohorts = Map.size . view cohorts $ conf
-  -- create socket
-  sock <- socket AF_INET Stream 0
-  -- make socket immediately reusable - eases debugging.
-  setSocketOption sock ReuseAddr 1
-  -- listen on TCP port
-  bindSocket sock (SockAddrInet (fromIntegral port) iNADDR_ANY)
-  -- allow a maximum of (#COHORTS) outstanding connections
-  Sock.listen sock nCohorts
-  replicate nCohorts (accept sock)
+followerMain = undefined
+-- followerMain conf = do
+--   let nCohorts = Map.size . view cohorts $ conf
+--   -- create socket
+--   sock <- socket AF_INET Stream 0
+--   -- make socket immediately reusable - eases debugging.
+--   setSocketOption sock ReuseAddr 1
+--   -- listen on TCP port
+--   bindSocket sock (SockAddrInet (fromIntegral . view (ownCohort.cohortPort) $ conf) iNADDR_ANY)
+--   -- allow a maximum of (#COHORTS) outstanding connections
+--   Sock.listen sock nCohorts
+--   replicate nCohorts (accept sock)
 
 
 leaderMain :: (Connection c, ToJSON a, FromJSON a, Show a) => PersistentState a -> ServerConfig s c a -> IO (Server s c a)
@@ -374,13 +381,13 @@ instance (ToJSON a, FromJSON a, Persist s) => Connection (SelfConnection s c a) 
     persist serv' >> writeIORef servRef serv' >> return ()
 
   -- TODO myId `mod` 2 to determine which RPC to send
-  listenMaybe (SelfConnection servRef midRef) = do
+  listen (SelfConnection servRef midRef) = do
     serv <- readIORef servRef
     requestInfo midRef serv >>= return . Just . appendEntriesFromLeader serv (logWithIndices serv)
 
-  fromConfig (Config.CohortConfig sid host port) = do
+  fromConfig conf@(CohortConfig sid host port) = do
     mid <- newIORef 0
-    serv <- newIORef . initializeFollower $ ServerConfig sid Follower Map.empty (fromName storageName)
+    serv <- newIORef . initializeFollower $ ServerConfig Follower conf Map.empty (fromName storageName)
     return $ SelfConnection serv mid
     where storageName = kLogDir ++ host ++ "_" ++ show port ++ ".local.json"
 
@@ -389,12 +396,12 @@ instance Show a => Show (SelfConnection s c a) where
          show (SelfConnection servRef _) = show . unsafePerformIO . readIORef $ servRef
 
 simpleConfig :: ClusterConfig
-simpleConfig = Config.ClusterConfig {
-    Config.leader = 1,
-    Config.servers = [
-      Config.CohortConfig 1 "localhost" 3001,
-      Config.CohortConfig 2 "localhost" 3002,
-      Config.CohortConfig 3 "localhost" 3003
+simpleConfig = ClusterConfig {
+    _clusterLeader = 1,
+    _clusterServers = [
+      CohortConfig 1 "localhost" 3001,
+      CohortConfig 2 "localhost" 3002,
+      CohortConfig 3 "localhost" 3003
       ]
     }
 
@@ -423,12 +430,13 @@ testManual = do
 
   print "Test: receiving messages."
   let me' = demoteToFollower me :: Server JsonStorage FakeConnection String
-  req <- listen FakeConnection
+  req <- fmap fromJust . listen $ FakeConnection
   let (resp, me'') = runState (processAppendEntries req) me'
   print resp
   print (view log me'')
   print "Done."
-    where fakeConf = ServerConfig 0 Booting followers (JsonStorage $ kLogDir ++ "test.json")
+    where fakeConf = ServerConfig Booting myConf followers (JsonStorage $ kLogDir ++ "test.json")
+          myConf = CohortConfig 1 "localhost" 1001
           followers = Map.fromList [
             (1, FakeConnection),
             (2, FakePartition),

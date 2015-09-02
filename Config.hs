@@ -1,22 +1,31 @@
-{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
 module Config where
-import GHC.Generics
 import Data.Aeson
+import Control.Monad
 
 import RaftTypes
 
-data CohortConfig = CohortConfig {
-  id :: ServerId,
-  hostname :: Hostname,
-  port :: Port
-  } deriving (Eq, Show, Generic)
+instance ToJSON CohortConfig where
+  toJSON (CohortConfig sid host port) = object [
+    "id" .= sid
+    , "hostname" .= host
+    , "port" .= port
+    ]
 
-data ClusterConfig = ClusterConfig {
-  leader :: ServerId,
-  servers :: [CohortConfig]
-  } deriving (Eq, Show, Generic)
+instance FromJSON CohortConfig where
+  parseJSON (Object v) = CohortConfig
+                         <$> v .: "id"
+                         <*> v .: "hostname"
+                         <*> v .: "port"
+  parseJSON _ = mzero
 
-instance ToJSON CohortConfig
-instance FromJSON CohortConfig
-instance ToJSON ClusterConfig
-instance FromJSON ClusterConfig
+instance ToJSON ClusterConfig where
+  toJSON (ClusterConfig ldr cs) = object [
+    "leader" .= ldr
+    , "servers" .= cs
+    ]
+
+instance FromJSON ClusterConfig where
+  parseJSON (Object v) = ClusterConfig
+                         <$> v .: "leader"
+                         <*> v .: "servers"

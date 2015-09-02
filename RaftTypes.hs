@@ -2,6 +2,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings #-}
 module RaftTypes where
 import qualified Prelude (log)
 import Prelude hiding (log)
@@ -12,7 +13,10 @@ import Control.Lens
 import Data.Aeson
 import Control.Monad.State
 import Control.Monad
-import Data.ByteString.Lazy.Internal (ByteString)
+import Data.Maybe
+import Data.Text.Lazy.Encoding
+import qualified Data.Text.Lazy as Text
+import qualified Data.ByteString.Lazy as BS
 
 data Role = Booting | Leader | Follower | Candidate
           deriving (Eq, Show)
@@ -32,14 +36,14 @@ type Port = Int
 data LogEntry a = LogEntry {
   _entryTerm :: Term,
   _entryData :: a
-  } deriving (Show, Generic)
+  } deriving (Eq, Show, Generic)
 makeLenses ''LogEntry
 
 type IndexedEntry a = (LogIndex, LogEntry a)
 
 data Log a = Log {
   _logEntries :: [LogEntry a]
-  } deriving (Show, Generic)
+  } deriving (Eq, Show, Generic)
 makeLenses ''Log
 
 logMap :: ([LogEntry a] -> [LogEntry b]) -> Log a -> Log b
@@ -67,19 +71,24 @@ instance FromJSON NilEntry where
 
 data MessageType = AppendEntries | AppendEntriesResponse
                  | RequestVote | RequestVoteResponse
-                 deriving Show
+                 deriving (Show, Generic)
 
 data MessageInfo = MessageInfo {
   _msgFrom :: ServerId,
   _msgId :: MessageId
-  } deriving Show
+  } deriving (Show, Generic)
 makeLenses ''MessageInfo
+
+newtype EncodedArg = EncodedArg BS.ByteString
+                     deriving Show
+rawArg :: EncodedArg -> BS.ByteString
+rawArg (EncodedArg bs) = bs
 
 data Message = Message {
   _msgType :: MessageType,
-  _msgArgs :: [(String, ByteString)],
+  _msgArgs :: [(String, EncodedArg)],
   _msgInfo :: MessageInfo
-  } deriving Show
+  } deriving (Show, Generic)
 makeLenses ''Message
 
 info :: Lens' Message MessageInfo
@@ -87,6 +96,34 @@ info = msgInfo
 
 type BaseMessage = MessageInfo -> Message
 type PendingMessage c = (c, Message)
+
+instance ToJSON EncodedArg where
+   toJSON (EncodedArg bs) = Data.Aeson.String . Text.toStrict . decodeUtf8 $ bs
+
+instance FromJSON EncodedArg where
+  parseJSON (Data.Aeson.String txt) = pure . EncodedArg . encodeUtf8 . Text.fromStrict $ txt
+
+instance ToJSON MessageType
+instance FromJSON MessageType
+instance ToJSON MessageId
+instance FromJSON MessageId
+instance ToJSON MessageInfo
+instance FromJSON MessageInfo
+instance ToJSON Message
+instance FromJSON Message
+
+--- Config types
+data CohortConfig = CohortConfig {
+  _cohortId :: ServerId,
+  _cohortHostname :: Hostname,
+  _cohortPort :: Port
+  } deriving (Eq, Show, Generic)
+makeLenses ''CohortConfig
+data ClusterConfig = ClusterConfig {
+  _clusterLeader :: ServerId,
+  _clusterServers :: [CohortConfig]
+  } deriving (Eq, Show, Generic)
+makeLenses ''ClusterConfig
 
 --- Storage types
 
@@ -101,11 +138,10 @@ class Persist s where
 
 --- Server type
 
-
 type ServerMap a = Map.Map ServerId a
 data ServerConfig s c e = ServerConfig {
-  _serverId :: ServerId,
   _role :: Role,
+  _ownCohort :: CohortConfig,
   _cohorts :: ServerMap c,
   _storage :: s e
   }
@@ -128,9 +164,11 @@ data Server s c e = Server {
   _outstanding :: Map MessageId (PendingMessage c)
   }
 makeLenses ''Server
+serverId :: Lens' (Server s c e) ServerId
+serverId = config.ownCohort.cohortId
 
 instance (Show e) => Show (Server s c e) where
-  show s = "=== Server " ++ show (view (config.serverId) s) ++ " state ===" ++ "\n"
+  show s = "=== Server " ++ show (view serverId s) ++ " state ===" ++ "\n"
            ++ "currentTerm: " ++ show (view currentTerm s) ++ "\n"
            ++ "votedFor: " ++ show (view votedFor s) ++ "\n"
            ++ "log: " ++ show (view log s) ++ "\n"

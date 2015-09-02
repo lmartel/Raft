@@ -14,7 +14,7 @@ import Data.ByteString.Lazy.Internal (ByteString)
 import RaftTypes
 
 extract :: FromJSON a => String -> Message -> Maybe a
-extract name msg = find (\(s, _) -> s == name) (view msgArgs msg) >>= (decode . snd)
+extract name msg = find (\(s, _) -> s == name) (view msgArgs msg) >>= (decode . rawArg . snd)
 
 kTerm = "term"
 kLeaderId = "leaderId"
@@ -62,7 +62,7 @@ heartbeatFromLeader :: ToJSON a => Server s c a -> BaseMessage
 heartbeatFromLeader = flip appendEntriesFromLeader []
 
 appendEntriesFromLeader :: ToJSON a => Server s c a -> [(LogIndex, LogEntry a)] -> BaseMessage
-appendEntriesFromLeader s es = appendEntries (view currentTerm s) (view (config.serverId) s) findPrevLogIndex findPrevLogTerm es (view commitIndex s)
+appendEntriesFromLeader s es = appendEntries (view currentTerm s) (view serverId s) findPrevLogIndex findPrevLogTerm es (view commitIndex s)
   where findPrevLogTerm :: Term
         findPrevLogTerm = case termAtIndex findPrevLogIndex s of
                            Nothing -> error "appendEntriesFromLeader :: gap in log!"
@@ -73,34 +73,37 @@ appendEntriesFromLeader s es = appendEntries (view currentTerm s) (view (config.
           [] -> viewLastLogIndex s
           (e:_) -> fst e - 1
 
+encodeArg :: ToJSON a => a -> EncodedArg
+encodeArg = EncodedArg . encode
+
 appendEntries :: ToJSON a => Term -> ServerId -> LogIndex -> Term -> [(LogIndex, LogEntry a)] -> LogIndex -> BaseMessage
 appendEntries t lid pli plt es lc = Message AppendEntries [
-  (kTerm, encode t),
-  (kLeaderId, encode lid),
-  (kPrevLogIndex, encode pli),
-  (kPrevLogTerm, encode plt),
-  (kEntries, encode es),
-  (kLeaderCommit, encode lc)
+  (kTerm, encodeArg t),
+  (kLeaderId, encodeArg lid),
+  (kPrevLogIndex, encodeArg pli),
+  (kPrevLogTerm, encodeArg plt),
+  (kEntries, encodeArg es),
+  (kLeaderCommit, encodeArg lc)
   ]
 
 appendEntriesResponse :: Term -> Bool -> BaseMessage
 appendEntriesResponse t s = Message AppendEntriesResponse [
-  (kTerm, encode t),
-  (kSuccess, encode s)
+  (kTerm, encodeArg t),
+  (kSuccess, encodeArg s)
   ]
 
 requestVote :: Term -> ServerId -> LogIndex -> Term -> BaseMessage
 requestVote t cid lli llt = Message RequestVote [
-  (kTerm, encode t),
-  (kCandidateId, encode cid),
-  (kLastLogIndex, encode lli),
-  (kLastLogTerm, encode llt)
+  (kTerm, encodeArg t),
+  (kCandidateId, encodeArg cid),
+  (kLastLogIndex, encodeArg lli),
+  (kLastLogTerm, encodeArg llt)
   ]
 
 requestVoteResponse :: Term -> Bool -> BaseMessage
 requestVoteResponse t vg = Message RequestVoteResponse [
-  (kTerm, encode t),
-  (kVoteGranted, encode vg)
+  (kTerm, encodeArg t),
+  (kVoteGranted, encodeArg vg)
   ]
 
 -- data AppendEntries e = AppendEntries {
