@@ -4,6 +4,7 @@ module Raft where
 import qualified Prelude (log)
 import Prelude hiding (log)
 import System.Environment (getArgs)
+import Control.Concurrent
 import Control.Lens
 import Control.Monad
 import Data.Aeson
@@ -56,9 +57,14 @@ demoteToFollower = set (config.role) Follower . set nextIndex Nothing . set matc
 
 --- Sending/receiving messages
 
+atomicGetNextMessageId :: IORef MessageId -> IO MessageId
+atomicGetNextMessageId ref = atomicModifyIORef ref (\mid -> (mid + 1, mid))
+
+atomicGetNextMessageIds :: Int -> IORef MessageId -> IO [MessageId]
+atomicGetNextMessageIds n ref = atomicModifyIORef ref (\mid -> (mid + fromIntegral n, take n [mid..]))
+
 requestInfo :: IORef MessageId -> Server s c a -> IO MessageInfo
-requestInfo midRef serv = readIORef midRef >>= writeNextMid
-  where writeNextMid mid = atomicWriteIORef midRef (mid + 1) >> return (MessageInfo (view serverId serv) mid)
+requestInfo midRef serv = MessageInfo (view serverId serv) <$> atomicGetNextMessageId midRef
 
 responseInfo :: Message -> Server s c a -> MessageInfo
 responseInfo req serv = MessageInfo (view serverId serv) (view (info.msgId) req)
@@ -66,12 +72,8 @@ responseInfo req serv = MessageInfo (view serverId serv) (view (info.msgId) req)
 prepareBroadcast :: IORef MessageId -> BaseMessage -> Server s c a -> IO [PendingMessage c]
 prepareBroadcast midRef msg serv
   | view (config.role) serv /= Leader = return []
-  | otherwise = readIORef midRef >>= writeNextMid . requests
-  where writeNextMid [] = return []
-        writeNextMid reqs = atomicWriteIORef midRef (nextMid reqs) >> return reqs
-        nextMid :: [PendingMessage c] -> MessageId
-        nextMid reqs = (1 + ) . last $ map (view (info.msgId) . snd) reqs
-        requests mid1 = zipWith prepareMessage (serverCohorts serv) [mid1..]
+  | otherwise = requests <$> atomicGetNextMessageIds (length . serverCohorts $ serv) midRef
+  where requests = zipWith prepareMessage (serverCohorts serv)
         prepareMessage c mid = (c, msg $ MessageInfo (view serverId serv) mid)
 
 expectResponsesTo :: [PendingMessage c] -> Raft s c a ()
@@ -274,6 +276,9 @@ singleThreadedFollowerMain = undefined
 
 followerMain :: Connection c => ServerConfig s c a -> IO (Server s c a)
 followerMain = undefined
+
+
+-- TODO: this code is for cohort discovery. Seems unnecessary since Raft config is static.
 -- followerMain conf = do
 --   let nCohorts = Map.size . view cohorts $ conf
 --   -- create socket
@@ -284,8 +289,7 @@ followerMain = undefined
 --   bindSocket sock (SockAddrInet (fromIntegral . view (ownCohort.cohortPort) $ conf) iNADDR_ANY)
 --   -- allow a maximum of (#COHORTS) outstanding connections
 --   Sock.listen sock nCohorts
---   replicate nCohorts (accept sock)
-
+--   map connectTo . replicate nCohorts accept $ sock
 
 leaderMain :: (Connection c, ToJSON a, FromJSON a, Show a) => PersistentState a -> ServerConfig s c a -> IO (Server s c a)
 leaderMain stableState@(_, _, startingLog) conf = do
