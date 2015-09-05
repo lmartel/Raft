@@ -292,11 +292,12 @@ debugMain mainFn serv = do
 followerMain :: (Persist s, Connection c, FromJSON a, ToJSON a) => Server s c a -> IO (Server s c a)
 followerMain serv0 = do
   serverState <- newMVar serv0
+  mainThread <- myThreadId
 
   let conns = map snd . Map.toList . view (config.cohorts) $ serv0
   listenerThreads <- mapM (spawn . forever . listenAndRespond serverState) conns
 
-  installHandler keyboardSignal (Catch $ cleanupAndExit (map fst listenerThreads) serverState) Nothing
+  installHandler keyboardSignal (Catch $ cleanupAndExit mainThread (map fst listenerThreads) serverState) Nothing
   mapM_ waitFor listenerThreads
   takeMVar serverState
 
@@ -312,16 +313,16 @@ followerMain serv0 = do
         threadDone :: MVar () -> Either SomeException a -> IO ()
         threadDone done _ = putMVar done ()
 
-        cleanupAndExit :: [ThreadId] -> MVar (Server s c a) -> IO ()
-        cleanupAndExit threads serverState = do
-          debug "Cleaning up..." $ takeMVar serverState >> mapM killThread threads
-          debug "All done." exitSuccess
+        cleanupAndExit :: ThreadId -> [ThreadId] -> MVar (Server s c a) -> IO ()
+        cleanupAndExit mainThread workers serverState = do
+          debug "Cleaning up..." $ takeMVar serverState >> mapM killThread workers
+          debug "All done." $ killThread mainThread
 
 
 listenAndRespond :: (Persist s, Connection c, FromJSON a, ToJSON a) => MVar (Server s c a) -> c -> IO ()
 listenAndRespond servBox conn = do
-  maybeReq <- listen conn
-  case maybeReq of
+  maybeReq <- debug "Worker thread listening..." (listen conn)
+  case debug "Worker thread received request." maybeReq of
    Nothing -> return ()
    (Just req) -> do
      serv <- takeMVar servBox
@@ -402,7 +403,7 @@ assertAllEqual msg expected = mapM_ (assertEqual msg expected)
 
 {-# NOINLINE debug #-}
 debug :: String -> a -> a
-debug err dat = unsafePerformIO (print err) `seq` dat
+debug err dat = unsafePerformIO (putStrLn err) `seq` dat
 -- debug _ = id
 
 {-# NOINLINE debug' #-}
