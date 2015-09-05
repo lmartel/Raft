@@ -19,6 +19,7 @@ class Connection c where
   fromConfig :: CohortConfig -> IO c
 
 data NilConnection = NilConnection
+                   deriving Show
 
 instance Connection NilConnection where
   request _ _ = return Nothing
@@ -46,6 +47,7 @@ instance Connection FakeConnection where
   fromConfig _ = return FakeConnection
 
 data NetworkConnection = NetworkConnection ServerId HostName PortID
+                       deriving Show
 
 networkSend :: Message -> NetworkConnection -> IO ()
 networkSend msg (NetworkConnection _ host portNum) = Network.sendTo host portNum . show . encode $ msg

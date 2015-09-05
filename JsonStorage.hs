@@ -6,10 +6,12 @@ import System.IO
 import Data.Aeson
 import Control.Monad
 import qualified Data.ByteString.Lazy as B
+import System.Directory
 
 import RaftTypes
 
 data JsonStorage a = JsonStorage String
+                   deriving Show
 
 filename :: JsonStorage a -> String
 filename (JsonStorage s) = s
@@ -22,14 +24,20 @@ instance Persist JsonStorage where
   readFromStable = readFromJson
   fromName = JsonStorage
 
+
 writeToJson :: ToJSON a => PersistentState a -> JsonStorage a -> IO ()
 writeToJson state stor = B.writeFile (filename stor) (encode state)
 
 readFromJson :: FromJSON a => JsonStorage a -> IO (PersistentState a)
-readFromJson stor = B.readFile (filename stor) >>= (\str -> case decode str of
+readFromJson stor = do
+  exists <- doesFileExist (filename stor)
+  if exists
+    then B.readFile (filename stor) >>= (\str -> case decode str of
                                                      Nothing -> error $ "cannot read or parse " ++ filename stor
                                                      -- TODO retry but backoff intelligently
                                                      (Just state') -> return state')
+    else return defaultPersistentState
+
 
 
 -- main :: IO ()

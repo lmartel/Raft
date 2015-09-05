@@ -7,6 +7,8 @@ import System.Environment (getArgs)
 import Control.Concurrent
 import Control.Lens
 import Control.Monad
+import Control.Monad.Trans
+import Control.Exception.Base
 import Data.Aeson
 import Data.List
 import Data.IORef
@@ -20,6 +22,8 @@ import qualified Data.ByteString.Lazy as ByteString
 import qualified Network.Socket as Sock (listen)
 import Network.Socket hiding (listen)
 import System.IO
+import System.Posix.Signals
+import System.Exit
 
 import Test.HUnit
 
@@ -264,18 +268,67 @@ readJSONConfig f myId = do
         myConf = find (\someConf -> view cohortId someConf == myId) . view clusterServers
 
 serverMain :: ServerId -> IO ()
-serverMain myId = undefined
--- serverMain myId = do
---   conf <- readJSONConfig kConfigFile myId :: IO (ServerConfig JsonStorage FakeConnection String)
---   case view role conf of
---    Leader -> leaderMain conf
---    Follower -> followerMain conf
+serverMain myId = do
+  conf <- readJSONConfig kConfigFile myId :: IO (ServerConfig JsonStorage NetworkConnection String)
+  serv <- fromPersist . initializeFollower $ conf
+  void . uncurry debugMain $ case view role conf of
+                              Leader -> (leaderMain, promoteToLeader serv)
+                              Follower -> (followerMain, serv)
 
-singleThreadedFollowerMain :: Connection c => ServerConfig s c a -> IO ()
-singleThreadedFollowerMain = undefined
+debugMain :: (Show a) => (Server s c a -> IO (Server s c a)) -> Server s c a -> IO (Server s c a)
+debugMain mainFn serv = do
+  let servInfo = show (view serverId serv) ++ " " ++ show (view (config.role) serv)
+  putStrLn $ "===== " ++ servInfo ++ " STARTING ====="
+  print serv
 
-followerMain :: Connection c => ServerConfig s c a -> IO (Server s c a)
-followerMain = undefined
+  serv' <- mainFn serv
+
+  putStrLn $ "===== " ++ servInfo ++ " FINISHING ====="
+  print serv'
+  putStrLn "===== ALL DONE ====="
+
+  return serv'
+
+followerMain :: (Persist s, Connection c, FromJSON a, ToJSON a) => Server s c a -> IO (Server s c a)
+followerMain serv0 = do
+  serverState <- newMVar serv0
+
+  let conns = map snd . Map.toList . view (config.cohorts) $ serv0
+  listenerThreads <- mapM (spawn . forever . listenAndRespond serverState) conns
+
+  installHandler keyboardSignal (Catch $ cleanupAndExit (map fst listenerThreads) serverState) Nothing
+  mapM_ waitFor listenerThreads
+  takeMVar serverState
+
+  where spawn :: IO () -> IO (ThreadId, MVar ())
+        spawn threadFn = do
+          done <- newEmptyMVar
+          tid <- forkFinally threadFn (threadDone done)
+          return (tid, done)
+
+        waitFor :: (a, MVar ()) -> IO ()
+        waitFor = takeMVar . snd
+
+        threadDone :: MVar () -> Either SomeException a -> IO ()
+        threadDone done _ = putMVar done ()
+
+        cleanupAndExit :: [ThreadId] -> MVar (Server s c a) -> IO ()
+        cleanupAndExit threads serverState = do
+          debug "Cleaning up..." $ takeMVar serverState >> mapM killThread threads
+          debug "All done." exitSuccess
+
+
+listenAndRespond :: (Persist s, Connection c, FromJSON a, ToJSON a) => MVar (Server s c a) -> c -> IO ()
+listenAndRespond servBox conn = do
+  maybeReq <- listen conn
+  case maybeReq of
+   Nothing -> return ()
+   (Just req) -> do
+     serv <- takeMVar servBox
+     let (resp, serv') = runState (handleRequest req) serv
+     persist serv'
+     putMVar servBox serv'
+     respond resp conn
 
 
 -- TODO: this code is for cohort discovery. Seems unnecessary since Raft config is static.
@@ -291,30 +344,17 @@ followerMain = undefined
 --   Sock.listen sock nCohorts
 --   map connectTo . replicate nCohorts accept $ sock
 
-leaderMain :: (Connection c, ToJSON a, FromJSON a, Show a) => PersistentState a -> ServerConfig s c a -> IO (Server s c a)
-leaderMain stableState@(_, _, startingLog) conf = do
+leaderMain :: (Connection c, ToJSON a, FromJSON a, Show a) => Server s c a -> IO (Server s c a)
+leaderMain serv = do
   nextMessageId <- newIORef 0
-
-  let serv = injectPersistentState stableState . promoteToLeader . initializeFollower $ conf
   let nCohorts = Map.size . view (config.cohorts) $ serv
 
-  putStrLn "===== LEADER STARTING ====="
-  print serv
-
-  let req = appendEntriesFromLeader serv (withIndices startingLog)
+  let req = appendEntriesFromLeader serv . logWithIndices $ serv
   requests <- prepareBroadcast nextMessageId req serv
   responses <- broadcastUntil majoritySuccessful requests
-  let serv' = execState (expectResponsesTo requests >> mapM handleResponse responses) serv
-
-  putStrLn "===== LEADER FINISHED ====="
-  print serv'
-  putStrLn "leaderMain done."
-  return serv'
+  return $ execState (expectResponsesTo requests >> mapM handleResponse responses) serv
   where majoritySuccessful :: [Message] -> Bool
         majoritySuccessful resps = True -- (\resps -> length (filter wasSuccessful resps) > nCohorts / 2)
-
-singleThreadedLeaderMain :: IO ()
-singleThreadedLeaderMain = undefined
 
 main :: IO ()
 main = do
@@ -412,9 +452,10 @@ simpleConfig = ClusterConfig {
 testLocalSystemWith :: Log String -> ServerId -> IO (Server JsonStorage (SelfConnection JsonStorage NilConnection String) String)
 testLocalSystemWith lg myId = do
   conf <- readJSONConfig kConfigFile myId
+  let serv = initializeFollower conf
   case view role conf of
-   Leader -> leaderMain (1, Just myId, lg) conf
-   Follower -> followerMain conf
+   Leader -> leaderMain . injectPersistentState (1, Just myId, lg) . promoteToLeader $ serv
+   Follower -> followerMain serv
 
 
 writeTestConfig :: ClusterConfig -> IO ()

@@ -144,7 +144,7 @@ data ServerConfig s c e = ServerConfig {
   _ownCohort :: CohortConfig,
   _cohorts :: ServerMap c,
   _storage :: s e
-  }
+  } deriving Show
 makeLenses ''ServerConfig
 
 data Server s c e = Server {
@@ -208,6 +208,9 @@ termAtIndex i s = entry i (view log s) >>= Just . view entryTerm
 
 
 -- Storage helpers
+defaultPersistentState :: PersistentState e
+defaultPersistentState = (0, Nothing, Log [])
+
 injectPersistentState :: PersistentState e -> Server s c e  -> Server s c e
 injectPersistentState (t, v, l) serv = set currentTerm t . set votedFor v . set log l $ serv
 
