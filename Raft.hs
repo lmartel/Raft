@@ -7,7 +7,6 @@ import System.Environment (getArgs)
 import Control.Concurrent
 import Control.Lens
 import Control.Monad
-import Control.Monad.Trans
 import Control.Exception.Base
 import Data.Aeson
 import Data.List
@@ -19,11 +18,7 @@ import System.IO.Unsafe
 import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.ByteString.Lazy as ByteString
-import qualified Network.Socket as Sock (listen)
-import Network.Socket hiding (listen)
-import System.IO
 import System.Posix.Signals
-import System.Exit
 
 import Test.HUnit
 
@@ -234,12 +229,12 @@ validateAppendEntries serv msg =  case Just . all (== True) =<< sequence [
 --- Startup and main
 
 kConfigDir :: String
-kConfigDir = "db/"
-kConfigFile :: String
-kConfigFile = kConfigDir ++ "config.json"
+kConfigDir = "conf/"
+kConfigFile :: ServerId -> String
+kConfigFile (ServerId sid) = kConfigDir ++ "config." ++ show sid ++ ".json"
 
 kLogDir :: String
-kLogDir = kConfigDir
+kLogDir = "db/"
 kLogFile :: String
 kLogFile = kLogDir ++ "log.json"
 
@@ -262,23 +257,26 @@ readJSONConfig f myId = do
   let maybeConf = decode confStr >>= (\clust -> liftM2 (,) (Just clust) (myConf clust))
   case maybeConf of
    Nothing -> return . error $ "cannot read or parse config file: " ++ f
-   (Just (me, clust)) -> configureSelf clust me (fromName kLogFile)
-
+   (Just (clust, me)) -> configureSelf me (filterMe myId clust) (fromName kLogFile)
   where myConf :: ClusterConfig -> Maybe CohortConfig
         myConf = find (\someConf -> view cohortId someConf == myId) . view clusterServers
+        -- TODO BETTER FIX
+        filterMe :: ServerId -> ClusterConfig -> ClusterConfig
+        filterMe sid = over clusterServers (filter ((/= sid) . view cohortId))
 
-serverMain :: ServerId -> IO ()
-serverMain myId = do
-  conf <- readJSONConfig kConfigFile myId :: IO (ServerConfig JsonStorage NetworkConnection String)
+serverMain :: ServerId -> Role -> IO ()
+serverMain myId role = do
+  conf <- readJSONConfig (kConfigFile myId) myId :: IO (ServerConfig JsonStorage NetworkConnection String)
   serv <- fromPersist . initializeFollower $ conf
-  void . uncurry debugMain $ case view role conf of
+  void . uncurry debugMain $ case role of
                               Leader -> (leaderMain, promoteToLeader serv)
                               Follower -> (followerMain, serv)
 
-debugMain :: (Show a) => (Server s c a -> IO (Server s c a)) -> Server s c a -> IO (Server s c a)
+debugMain :: (Show c, Show a) => (Server s c a -> IO (Server s c a)) -> Server s c a -> IO (Server s c a)
 debugMain mainFn serv = do
   let servInfo = show (view serverId serv) ++ " " ++ show (view (config.role) serv)
   putStrLn $ "===== " ++ servInfo ++ " STARTING ====="
+  print $ view config serv
   print serv
 
   serv' <- mainFn serv
@@ -311,6 +309,7 @@ followerMain serv0 = do
         waitFor = takeMVar . snd
 
         threadDone :: MVar () -> Either SomeException a -> IO ()
+        threadDone done (Left ex) = debug (show ex) $ putMVar done ()
         threadDone done _ = putMVar done ()
 
         cleanupAndExit :: ThreadId -> [ThreadId] -> MVar (Server s c a) -> IO ()
@@ -362,7 +361,8 @@ main = do
   args <- getArgs
   (case args of
    (myId:"test":_) -> testMain . fromIntegral . read $ myId
-   (myId:_) -> serverMain . fromIntegral . read $ myId
+   (myId:"leader":_) -> serverMain (fromIntegral . read $ myId) Leader
+   (myId:_) -> serverMain (fromIntegral . read $ myId) Follower
    _ -> error "Invalid arguments." -- TODO fancier arg parsing / flags
    )
 
@@ -452,7 +452,7 @@ simpleConfig = ClusterConfig {
 
 testLocalSystemWith :: Log String -> ServerId -> IO (Server JsonStorage (SelfConnection JsonStorage NilConnection String) String)
 testLocalSystemWith lg myId = do
-  conf <- readJSONConfig kConfigFile myId
+  conf <- readJSONConfig (kConfigFile myId) myId
   let serv = initializeFollower conf
   case view role conf of
    Leader -> leaderMain . injectPersistentState (1, Just myId, lg) . promoteToLeader $ serv
@@ -463,7 +463,7 @@ writeTestConfig :: ClusterConfig -> IO ()
 writeTestConfig = ByteString.writeFile (kConfigDir ++ "config.auto.json") . encode
 
 readTestConfig :: IO (Maybe ClusterConfig)
-readTestConfig = decode <$> ByteString.readFile kConfigFile
+readTestConfig = decode <$> ByteString.readFile (kConfigDir ++ "config.auto.json")
 
 testManual :: IO ()
 testManual = do

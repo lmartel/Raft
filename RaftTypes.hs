@@ -144,7 +144,7 @@ data ServerConfig s c e = ServerConfig {
   _ownCohort :: CohortConfig,
   _cohorts :: ServerMap c,
   _storage :: s e
-  } deriving Show
+  }
 makeLenses ''ServerConfig
 
 data Server s c e = Server {
@@ -166,6 +166,9 @@ data Server s c e = Server {
 makeLenses ''Server
 serverId :: Lens' (Server s c e) ServerId
 serverId = config.ownCohort.cohortId
+
+instance Show (ServerConfig s c e) where
+  show conf = "ServerConfig (" ++ show (view role conf) ++ ") (" ++ show (view ownCohort conf) ++ ")"
 
 instance (Show e) => Show (Server s c e) where
   show s = "=== Server " ++ show (view serverId s) ++ " state ===" ++ "\n"
