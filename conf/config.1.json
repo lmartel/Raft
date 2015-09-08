@@ -4,17 +4,17 @@
         {
             "id": 1,
             "hostname": "localhost",
-            "port": 3011
+            "port": 3001
         }
         , {
             "id": 2,
             "hostname": "localhost",
-            "port": 3012
+            "port": 3002
         }
         , {
             "id": 3,
             "hostname": "localhost",
-            "port": 3013
+            "port": 3003
         }
 
     ]

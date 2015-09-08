@@ -15,12 +15,11 @@ def sys(arg_str)
   system(arg_str, out: $stdout, err: :out)
 end
 
-task default: %w[compile]
+task default: %w[compile docker:compile]
 
 task :compile do
     `mkdir -p build`
     sys compile(:osx)
-    sys %Q[docker run --rm -v #{mount} --name compile-raft raft /bin/sh -c "#{compile(:linux)}"]
 end
 
 task :run, [:server_id] do |t, args|
@@ -34,12 +33,13 @@ namespace :docker do
   end
 
   task :compile do
-
+    sys %Q[docker run --rm -v #{mount} --name compile-raft raft /bin/sh -c "#{compile(:linux)}"]
   end
 
   task :run, [:server_id] do |t, args|
     sid = args[:server_id] || (puts "Missing arg: serverId" && exit(1))
-    ports = "-p #{sid}3001:3001 -p #{sid}3002:3002 -p #{sid}3003:3003"
+    ports = ''
+    # ports = "-p #{sid}3001:3001 -p #{sid}3002:3002 -p #{sid}3003:3003"
     begin
       `docker rm -f cohort#{sid}`
       sys %Q[docker run -t --rm #{ports} -v #{mount} --name cohort#{sid} raft /bin/sh -c "/raft/raft-linux #{sid}"]

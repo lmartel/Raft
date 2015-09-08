@@ -5,7 +5,10 @@ import Control.Monad
 import Data.IORef
 import Data.Aeson
 
+import System.IO
 import Network
+import Network.Socket
+
 
 import RaftTypes
 import MessageTypes
@@ -39,28 +42,35 @@ instance Connection FakeConnection where
   request _ FakePartition = return Nothing
   respond _ _ = return ()
 
-  listen FakePartition = listen FakePartition
+  listen FakePartition = ConnectionTypes.listen FakePartition
   listen FakeConnection = return . Just . appendEntries 20 1 0 0 newEntries 3 $ me
     where newEntries = zip [1..] [LogEntry 19 "first log entry", LogEntry 20 "second log entry"]
           me = MessageInfo 1 1337
 
   fromConfig _ = return FakeConnection
 
-data NetworkConnection = NetworkConnection ServerId HostName PortID
-                       deriving Show
+data SimpleNetworkConnection = SimpleNetworkConnection ServerId HostName PortID
+                             deriving Show
 
-networkSend :: Message -> NetworkConnection -> IO ()
-networkSend msg (NetworkConnection _ host portNum) = Network.sendTo host portNum . show . encode $ msg
+instance Connection SimpleNetworkConnection where
+  fromConfig (CohortConfig sid host portNum) = pure $ SimpleNetworkConnection sid host (PortNumber . fromIntegral $ portNum)
 
-networkRecv :: NetworkConnection -> IO (Maybe Message)
-networkRecv (NetworkConnection _ host portNum) = liftM (decode . read) $ Network.recvFrom host portNum
+  request msg net = respond msg net >> ConnectionTypes.listen net
+  respond msg (SimpleNetworkConnection _ host portNum) = Network.sendTo host portNum . show . encode $ msg
+  listen (SimpleNetworkConnection _ host portNum) = liftM (decode . read) $ Network.recvFrom host portNum
 
-instance Connection NetworkConnection where
-  fromConfig (CohortConfig sid host portNum) = pure $ NetworkConnection sid host (PortNumber . fromIntegral $ portNum)
+data HandleConnection = HandleConnection ServerId Handle
+                      deriving Show
 
-  request msg net = networkSend msg net >> networkRecv net
-  respond = networkSend
-  listen = networkRecv
+instance Connection HandleConnection where
+  fromConfig (CohortConfig sid host portNum) = do
+    putStrLn ("Connecting to follower at " ++ host ++ ":" ++ show portNum)
+    hdl <- connectTo host . PortNumber . fromIntegral $ portNum
+    return . HandleConnection sid $ hdl
+
+  request msg net = respond msg net >> ConnectionTypes.listen net
+  respond msg (HandleConnection _ hdl) = hPrint hdl (encode msg)
+  listen (HandleConnection _ hdl) = decode . read <$> hGetLine hdl
 
 -- TODO get updates from the client somehow
 class ClientConnection c a where

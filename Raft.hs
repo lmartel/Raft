@@ -19,6 +19,10 @@ import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.ByteString.Lazy as ByteString
 import System.Posix.Signals
+import System.IO
+import Network.Socket hiding (listen)
+import qualified Network.Socket as Sock (listen)
+
 
 import Test.HUnit
 
@@ -235,8 +239,8 @@ kConfigFile (ServerId sid) = kConfigDir ++ "config." ++ show sid ++ ".json"
 
 kLogDir :: String
 kLogDir = "db/"
-kLogFile :: String
-kLogFile = kLogDir ++ "log.json"
+kLogFile :: ServerId -> String
+kLogFile (ServerId sid) = kLogDir ++ "log." ++ show sid ++ ".json"
 
 configureCohorts :: Connection c => ClusterConfig -> IO (ServerMap c)
 configureCohorts conf = liftM Map.fromList $ pure conf
@@ -257,20 +261,12 @@ readJSONConfig f myId = do
   let maybeConf = decode confStr >>= (\clust -> liftM2 (,) (Just clust) (myConf clust))
   case maybeConf of
    Nothing -> return . error $ "cannot read or parse config file: " ++ f
-   (Just (clust, me)) -> configureSelf me (filterMe myId clust) (fromName kLogFile)
+   (Just (clust, me)) -> configureSelf me clust (fromName . kLogFile $ view cohortId me)
   where myConf :: ClusterConfig -> Maybe CohortConfig
         myConf = find (\someConf -> view cohortId someConf == myId) . view clusterServers
-        -- TODO BETTER FIX
+
         filterMe :: ServerId -> ClusterConfig -> ClusterConfig
         filterMe sid = over clusterServers (filter ((/= sid) . view cohortId))
-
-serverMain :: ServerId -> Role -> IO ()
-serverMain myId role = do
-  conf <- readJSONConfig (kConfigFile myId) myId :: IO (ServerConfig JsonStorage NetworkConnection String)
-  serv <- fromPersist . initializeFollower $ conf
-  void . uncurry debugMain $ case role of
-                              Leader -> (leaderMain, promoteToLeader serv)
-                              Follower -> (followerMain, serv)
 
 debugMain :: (Show c, Show a) => (Server s c a -> IO (Server s c a)) -> Server s c a -> IO (Server s c a)
 debugMain mainFn serv = do
@@ -291,36 +287,45 @@ followerMain :: (Persist s, Connection c, FromJSON a, ToJSON a) => Server s c a 
 followerMain serv0 = do
   serverState <- newMVar serv0
   mainThread <- myThreadId
+  listenerThreads <- newMVar []
 
-  let conns = map snd . Map.toList . view (config.cohorts) $ serv0
-  listenerThreads <- mapM (spawn . forever . listenAndRespond serverState) conns
+  -- create socket
+  sock <- socket AF_INET Stream 0
+  -- make socket immediately reusable - eases debugging.
+  setSocketOption sock ReuseAddr 1
+  -- listen on TCP port
+  bindSocket sock (SockAddrInet (fromIntegral . view (config.ownCohort.cohortPort) $ serv0) iNADDR_ANY)
+  -- allow a maximum of (#COHORTS) outstanding connections
+  Sock.listen sock 5
 
-  installHandler keyboardSignal (Catch $ cleanupAndExit mainThread (map fst listenerThreads) serverState) Nothing
-  mapM_ waitFor listenerThreads
+  installHandler keyboardSignal (Catch $ cleanupAndExit mainThread listenerThreads serverState) Nothing
+  spawnLoop sock serverState listenerThreads
   takeMVar serverState
 
-  where spawn :: IO () -> IO (ThreadId, MVar ())
-        spawn threadFn = do
-          done <- newEmptyMVar
-          tid <- forkFinally threadFn (threadDone done)
-          return (tid, done)
+  where spawnLoop :: (Persist s, FromJSON a, ToJSON a) => Socket -> MVar (Server s c a) -> MVar [ThreadId] -> IO ()
+        spawnLoop sock servState listenersQueue = do
+          (sock', _) <- accept sock
+          -- TODO deal with EOF, it means the leader died.
+          -- Functionality OK, but needs better error message.
+          hdl <- debug "Worker thread listening..." $ socketToHandle sock' ReadWriteMode
+          hSetBuffering hdl NoBuffering
 
-        waitFor :: (a, MVar ()) -> IO ()
-        waitFor = takeMVar . snd
+          listeners <- takeMVar listenersQueue
+          newListener <- forkIO . forever $ listenAndRespond servState (HandleConnection (-1) hdl) -- TODO is Id needed here
+          putMVar listenersQueue (newListener : listeners)
 
-        threadDone :: MVar () -> Either SomeException a -> IO ()
-        threadDone done (Left ex) = debug (show ex) $ putMVar done ()
-        threadDone done _ = putMVar done ()
+          spawnLoop sock servState listenersQueue
 
-        cleanupAndExit :: ThreadId -> [ThreadId] -> MVar (Server s c a) -> IO ()
-        cleanupAndExit mainThread workers serverState = do
-          debug "Cleaning up..." $ takeMVar serverState >> mapM killThread workers
-          debug "All done." $ killThread mainThread
+        cleanupAndExit :: ThreadId -> MVar [ThreadId] -> MVar (Server s c a) -> IO ()
+        cleanupAndExit mainThread workersQueue serverState = do
+          serverLock <- debug "Cleaning up..." $ takeMVar serverState
+          mapM killThread <$> takeMVar workersQueue
+          debug "All done." $ killThread mainThread -- TODO finish program instead
 
 
-listenAndRespond :: (Persist s, Connection c, FromJSON a, ToJSON a) => MVar (Server s c a) -> c -> IO ()
+listenAndRespond :: (Persist s, Connection conn, FromJSON a, ToJSON a) => MVar (Server s c a) -> conn -> IO ()
 listenAndRespond servBox conn = do
-  maybeReq <- debug "Worker thread listening..." (listen conn)
+  maybeReq <-  listen conn
   case debug "Worker thread received request." maybeReq of
    Nothing -> return ()
    (Just req) -> do
@@ -330,41 +335,40 @@ listenAndRespond servBox conn = do
      putMVar servBox serv'
      respond resp conn
 
-
--- TODO: this code is for cohort discovery. Seems unnecessary since Raft config is static.
--- followerMain conf = do
---   let nCohorts = Map.size . view cohorts $ conf
---   -- create socket
---   sock <- socket AF_INET Stream 0
---   -- make socket immediately reusable - eases debugging.
---   setSocketOption sock ReuseAddr 1
---   -- listen on TCP port
---   bindSocket sock (SockAddrInet (fromIntegral . view (ownCohort.cohortPort) $ conf) iNADDR_ANY)
---   -- allow a maximum of (#COHORTS) outstanding connections
---   Sock.listen sock nCohorts
---   map connectTo . replicate nCohorts accept $ sock
-
-leaderMain :: (Connection c, ToJSON a, FromJSON a, Show a) => Server s c a -> IO (Server s c a)
+leaderMain :: (Connection c) => Server s c String -> IO (Server s c String)
 leaderMain serv = do
   nextMessageId <- newIORef 0
   let nCohorts = Map.size . view (config.cohorts) $ serv
 
-  let req = appendEntriesFromLeader serv . logWithIndices $ serv
+  let req = appendEntriesFromLeader serv . logWithIndices $ serv -- TODO pull from client. Also deal with double-persist on leader
   requests <- prepareBroadcast nextMessageId req serv
   responses <- broadcastUntil majoritySuccessful requests
+  responses' <- broadcastUntil majoritySuccessful requests
   return $ execState (expectResponsesTo requests >> mapM handleResponse responses) serv
   where majoritySuccessful :: [Message] -> Bool
         majoritySuccessful resps = True -- (\resps -> length (filter wasSuccessful resps) > nCohorts / 2)
 
+
 main :: IO ()
 main = do
   args <- getArgs
-  (case args of
+  case args of
    (myId:"test":_) -> testMain . fromIntegral . read $ myId
-   (myId:"leader":_) -> serverMain (fromIntegral . read $ myId) Leader
-   (myId:_) -> serverMain (fromIntegral . read $ myId) Follower
+
+   (myId:"leader":_) -> do
+     let sid = fromIntegral . read $ myId
+     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig JsonStorage HandleConnection String)
+     serv <- fromPersist . initializeFollower $ conf
+     void $ debugMain leaderMain (promoteToLeader serv)
+
+   (myId:_) -> do
+     let sid = fromIntegral . read $ myId
+     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig JsonStorage NilConnection String)
+     serv <- fromPersist . initializeFollower $ conf
+     void $ debugMain followerMain serv
+
    _ -> error "Invalid arguments." -- TODO fancier arg parsing / flags
-   )
+
 
 -- Testing and testing utils
 
