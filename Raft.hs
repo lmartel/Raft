@@ -230,8 +230,10 @@ processAppendEntries msg = do
         appendNew :: [IndexedEntry a] -> Log a -> Log a
         appendNew [] lg = lg
         appendNew ((i,e):es) lg
+          | i < 1 + lastIndex lg  = appendNew es lg
           | i == 1 + lastIndex lg = appendNew es $ over logEntries (++ [e]) lg
-          | otherwise = debug "processAppendEntries :: Error, there's a hole in the log!" lg
+          | otherwise             = debug ("processAppendEntries :: Error, there's a hole in the log! Last index: "
+                                           ++ show (lastIndex lg) ++ "; Entry index: " ++ show i) lg
 
 validateAppendEntries :: FromJSON a => Server s c a -> Message -> Maybe [IndexedEntry a]
 validateAppendEntries serv msg =  case Just . all (== True) =<< sequence [
