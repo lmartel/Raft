@@ -1,10 +1,13 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleInstances #-}
 module ConnectionTypes where
+import Control.Concurrent
 import Control.Lens
 import Control.Monad
 import Data.IORef
 import Data.Aeson
 
+import System.Posix.Signals
 import System.IO
 import Network
 import Network.Socket
@@ -72,6 +75,24 @@ instance Connection HandleConnection where
   respond msg (HandleConnection _ hdl) = hPrint hdl (encode msg)
   listen (HandleConnection _ hdl) = decode . read <$> hGetLine hdl
 
--- TODO get updates from the client somehow
-class ClientConnection c a where
-  getUpdate :: c a -> IO a
+
+
+class ClientConnection c where
+  getLogEntry :: c a -> IO a
+  committed :: Show a => a -> c a -> IO ()
+
+data SimpleIncrementingClient a = SIClient (Int -> a) (IORef Int)
+
+newTestSIClient :: IO (SimpleIncrementingClient String)
+newTestSIClient = SIClient (\i -> "Log Entry: spacedate " ++ show i) <$> newIORef 1
+
+instance ClientConnection SimpleIncrementingClient where
+  getLogEntry (SIClient convert ctr) = threadDelay 333000 >> convert <$> atomicModifyIORef ctr (\i -> (i + 1, i))
+  committed x _ = putStrLn $ "!! COMMITTED `" ++ show x ++ "`"
+
+
+data AbortClient a = AbortClient
+
+instance ClientConnection AbortClient where
+  getLogEntry _ = raiseSignal keyboardSignal >> threadDelay 999999 >> error "unused"
+  committed x _ = putStrLn $ "!! COMMITTED `" ++ show x ++ "`"

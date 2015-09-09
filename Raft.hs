@@ -163,15 +163,36 @@ handleAppendEntriesResponse msg True = do
    (Just (_, req)) -> case lastSentIndex =<< entries req of
                        Nothing -> put me
                        (Just matchedId) -> put
+                                           . checkCommitted (sentIndices =<< entries req)
                                            . over matchIndex (fmap $ Map.insert responder matchedId)
                                            . over nextIndex (fmap . Map.insert responder $ matchedId + 1)
                                            $ me
   where respId = view (info.msgId) msg
         responder = view (info.msgFrom) msg
 
+        sentIndices :: [(LogIndex, LogEntry NilEntry)] -> Maybe [LogIndex]
+        sentIndices [] = Nothing
+        sentIndices es = Just . map fst $ es
+
         lastSentIndex :: [(LogIndex, LogEntry NilEntry)] -> Maybe LogIndex
-        lastSentIndex [] = Nothing
-        lastSentIndex es = Just . fst . last $ es
+        lastSentIndex = fmap last . sentIndices
+
+checkCommitted :: Maybe [LogIndex] -> Server s c a -> Server s c a
+checkCommitted Nothing = id
+checkCommitted (Just x) = checkCommitted' x
+  where checkCommitted' [] serv = serv
+        checkCommitted' (n:ns) serv = if n > view commitIndex serv
+                                         && majorityMatched n serv
+                                         && termAtIndex n serv == Just (view currentTerm serv)
+                                      then checkCommitted' ns . set commitIndex n $ serv
+                                      else serv
+
+
+majorityMatched :: LogIndex -> Server s c a -> Bool
+majorityMatched n serv = case view matchIndex serv of
+  Nothing -> False
+  (Just mp) -> 2 * Map.size (Map.filter (>= n) mp)
+               > Map.size mp
 
 handleRequestVoteResponse :: Message -> Bool -> Raft s c a ()
 handleRequestVoteResponse = undefined
@@ -283,11 +304,12 @@ debugMain mainFn serv = do
 
   return serv'
 
-followerMain :: (Persist s, Connection c, FromJSON a, ToJSON a) => Server s c a -> IO (Server s c a)
+followerMain :: (Persist s, Connection c, FromJSON a, ToJSON a, Show a) => Server s c a -> IO (Server s c a)
 followerMain serv0 = do
   serverState <- newMVar serv0
+  workerThreads <- newMVar []
+  allDone <- newEmptyMVar
   mainThread <- myThreadId
-  listenerThreads <- newMVar []
 
   -- create socket
   sock <- socket AF_INET Stream 0
@@ -298,8 +320,9 @@ followerMain serv0 = do
   -- allow a maximum of (#COHORTS) outstanding connections
   Sock.listen sock 5
 
-  installHandler keyboardSignal (Catch $ cleanupAndExit mainThread listenerThreads serverState) Nothing
-  spawnLoop sock serverState listenerThreads
+  installHandler keyboardSignal (Catch $ cleanupAndExit serverState workerThreads allDone) Nothing
+  snocQueue workerThreads <$> forkIO (spawnLoop sock serverState workerThreads)
+  takeMVar allDone
   takeMVar serverState
 
   where spawnLoop :: (Persist s, FromJSON a, ToJSON a) => Socket -> MVar (Server s c a) -> MVar [ThreadId] -> IO ()
@@ -310,18 +333,21 @@ followerMain serv0 = do
           hdl <- debug "Worker thread listening..." $ socketToHandle sock' ReadWriteMode
           hSetBuffering hdl NoBuffering
 
-          listeners <- takeMVar listenersQueue
           newListener <- forkIO . forever $ listenAndRespond servState (HandleConnection (-1) hdl) -- TODO is Id needed here
-          putMVar listenersQueue (newListener : listeners)
+          snocQueue listenersQueue newListener
 
           spawnLoop sock servState listenersQueue
 
-        cleanupAndExit :: ThreadId -> MVar [ThreadId] -> MVar (Server s c a) -> IO ()
-        cleanupAndExit mainThread workersQueue serverState = do
+        cleanupAndExit :: (Show a) => MVar (Server s c a) -> MVar [ThreadId] -> MVar () -> IO ()
+        cleanupAndExit serverState workersQueue done = do
           serverLock <- debug "Cleaning up..." $ takeMVar serverState
           mapM killThread <$> takeMVar workersQueue
-          debug "All done." $ killThread mainThread -- TODO finish program instead
+          putMVar serverState serverLock
+          debug "Workers killed." $ putMVar done ()
 
+
+snocQueue :: MVar [a] -> a -> IO ()
+snocQueue q v = takeMVar q >>= putMVar q . (v :)
 
 listenAndRespond :: (Persist s, Connection conn, FromJSON a, ToJSON a) => MVar (Server s c a) -> conn -> IO ()
 listenAndRespond servBox conn = do
@@ -335,18 +361,61 @@ listenAndRespond servBox conn = do
      putMVar servBox serv'
      respond resp conn
 
-leaderMain :: (Connection c) => Server s c String -> IO (Server s c String)
-leaderMain serv = do
+leaderMain :: (ClientConnection cli, Connection c) => cli String -> Server s c String -> IO (Server s c String)
+leaderMain cli serv0 = do
+  serverState <- newEmptyMVar
   nextMessageId <- newIORef 0
-  let nCohorts = Map.size . view (config.cohorts) $ serv
+  allDone <- newEmptyMVar
 
-  let req = appendEntriesFromLeader serv . logWithIndices $ serv -- TODO pull from client. Also deal with double-persist on leader
+  let nCohorts = Map.size . view (config.cohorts) $ serv0
+
+  -- TODO deal with double-persist on leader
+  -- TODO catch up intelligently with CommitIndex / MatchIndex
+  broadcastTid <- forkIO $ broadcastThread cli nextMessageId serverState
+  installHandler keyboardSignal (Catch $ cleanupAndExit serverState broadcastTid allDone) Nothing
+  putMVar serverState serv0
+  takeMVar allDone
+  takeMVar serverState
+    where cleanupAndExit :: MVar (Server s c a) -> ThreadId -> MVar () -> IO ()
+          cleanupAndExit servBox broadcastTid done = do
+            -- TODO: locking on server state probably not necessary (due to safety guarantees)
+            serverLock <- takeMVar servBox
+            killThread broadcastTid
+            putMVar servBox serverLock
+            putMVar done ()
+
+broadcastThread :: (ClientConnection cli, Connection c) => cli String -> IORef MessageId -> MVar (Server s c String) -> IO ()
+broadcastThread cli nextMessageId servBox = do
+  serv0 <- takeMVar servBox
+  let catchUp = appendEntriesFromLeader serv0 . logWithIndices $ serv0
+  serv <- leaderBroadcast nextMessageId catchUp serv0
+  putMVar servBox serv
+  leaderLoop nextMessageId cli servBox
+
+leaderLoop :: (ClientConnection cli, Connection c) => IORef MessageId -> cli String -> MVar (Server s c String) -> IO ()
+leaderLoop nextMid cli servBox = do
+  nextLogEntry <- getLogEntry cli
+  serv0 <- takeMVar servBox
+
+  let serv = over log (logMap (++ [LogEntry (view currentTerm serv0) nextLogEntry])) serv0
+  let update = appendEntriesFromLeader serv [last . logWithIndices $ serv]
+  requests <- prepareBroadcast nextMid update serv
+  responses <- broadcastUntil majoritySuccessful requests
+  let serv' = execState (expectResponsesTo requests >> mapM handleResponse responses) serv
+  putMVar servBox serv'
+
+  let newCommits = mapMaybe (flip entry $ view log serv) [1 + view commitIndex serv .. view commitIndex serv']
+  mapM_ (flip committed cli . view entryData) newCommits
+  leaderLoop nextMid cli servBox
+
+leaderBroadcast :: (Connection c, ToJSON a, FromJSON a) => IORef MessageId -> BaseMessage -> Server s c a -> IO (Server s c a)
+leaderBroadcast nextMessageId req serv = do
   requests <- prepareBroadcast nextMessageId req serv
   responses <- broadcastUntil majoritySuccessful requests
-  responses' <- broadcastUntil majoritySuccessful requests
   return $ execState (expectResponsesTo requests >> mapM handleResponse responses) serv
-  where majoritySuccessful :: [Message] -> Bool
-        majoritySuccessful resps = True -- (\resps -> length (filter wasSuccessful resps) > nCohorts / 2)
+
+majoritySuccessful :: [Message] -> Bool
+majoritySuccessful resps = True -- (\resps -> length (filter wasSuccessful resps) > nCohorts / 2)
 
 
 main :: IO ()
@@ -359,7 +428,8 @@ main = do
      let sid = fromIntegral . read $ myId
      conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig JsonStorage HandleConnection String)
      serv <- fromPersist . initializeFollower $ conf
-     void $ debugMain leaderMain (promoteToLeader serv)
+     client <- newTestSIClient
+     void $ debugMain (leaderMain client) (promoteToLeader serv)
 
    (myId:_) -> do
      let sid = fromIntegral . read $ myId
@@ -367,7 +437,7 @@ main = do
      serv <- fromPersist . initializeFollower $ conf
      void $ debugMain followerMain serv
 
-   _ -> error "Invalid arguments." -- TODO fancier arg parsing / flags
+   _ -> error "Invalid arguments."
 
 
 -- Testing and testing utils
@@ -459,7 +529,7 @@ testLocalSystemWith lg myId = do
   conf <- readJSONConfig (kConfigFile myId) myId
   let serv = initializeFollower conf
   case view role conf of
-   Leader -> leaderMain . injectPersistentState (1, Just myId, lg) . promoteToLeader $ serv
+   Leader -> leaderMain AbortClient . injectPersistentState (1, Just myId, lg) . promoteToLeader $ serv
    Follower -> followerMain serv
 
 
