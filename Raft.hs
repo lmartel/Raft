@@ -120,10 +120,8 @@ broadcastUntil fn = broadcastUntil' . map Right
 handleRequest :: FromJSON a => Message -> Raft s c a Message
 handleRequest msg = case view msgType msg of
   AppendEntries -> processAppendEntries msg
-   -- TODO requestvote
+  RequestVote -> undefined
 
-
--- TODO figure out maybeT
 handleResponse :: FromJSON a => Message -> Raft s c a ()
 handleResponse msg = do
   let maybeMalformed = [
@@ -196,7 +194,6 @@ majorityMatched n serv = case view matchIndex serv of
 
 handleRequestVoteResponse :: Message -> Bool -> Raft s c a ()
 handleRequestVoteResponse = undefined
--- retryIfNeeded ::
 
 processAppendEntries :: FromJSON a => Message -> Raft s c a Message
 processAppendEntries msg = do
@@ -234,7 +231,7 @@ processAppendEntries msg = do
         appendNew [] lg = lg
         appendNew ((i,e):es) lg
           | i == 1 + lastIndex lg = appendNew es $ over logEntries (++ [e]) lg
-          | otherwise = error "processAppendEntries :: Error, there's a hole in the log!" -- TODO address this error
+          | otherwise = debug "processAppendEntries :: Error, there's a hole in the log!" lg
 
 validateAppendEntries :: FromJSON a => Server s c a -> Message -> Maybe [IndexedEntry a]
 validateAppendEntries serv msg =  case Just . all (== True) =<< sequence [
@@ -275,7 +272,6 @@ configureSelf myConf cluster stor = liftM (\clust' -> ServerConfig myRole myConf
                  then Leader
                  else Follower
 
--- TODO: generalize log entry type (use reflection?)
 readJSONConfig :: (Persist s, Connection c) => String -> ServerId -> IO (ServerConfig s c String)
 readJSONConfig f myId = do
   confStr <- ByteString.readFile f
@@ -328,12 +324,10 @@ followerMain serv0 = do
   where spawnLoop :: (Persist s, FromJSON a, ToJSON a) => Socket -> MVar (Server s c a) -> MVar [ThreadId] -> IO ()
         spawnLoop sock servState listenersQueue = do
           (sock', _) <- accept sock
-          -- TODO deal with EOF, it means the leader died.
-          -- Functionality OK, but needs better error message.
           hdl <- debug "Worker thread listening..." $ socketToHandle sock' ReadWriteMode
           hSetBuffering hdl NoBuffering
 
-          newListener <- forkIO . forever $ listenAndRespond servState (HandleConnection (-1) hdl) -- TODO is Id needed here
+          newListener <- forkIO . forever $ listenAndRespond servState (HandleConnection hdl)
           snocQueue listenersQueue newListener
 
           spawnLoop sock servState listenersQueue
@@ -369,8 +363,6 @@ leaderMain cli serv0 = do
 
   let nCohorts = Map.size . view (config.cohorts) $ serv0
 
-  -- TODO deal with double-persist on leader
-  -- TODO catch up intelligently with CommitIndex / MatchIndex
   broadcastTid <- forkIO $ broadcastThread cli nextMessageId serverState
   installHandler keyboardSignal (Catch $ cleanupAndExit serverState broadcastTid allDone) Nothing
   putMVar serverState serv0
@@ -378,7 +370,6 @@ leaderMain cli serv0 = do
   takeMVar serverState
     where cleanupAndExit :: MVar (Server s c a) -> ThreadId -> MVar () -> IO ()
           cleanupAndExit servBox broadcastTid done = do
-            -- TODO: locking on server state probably not necessary (due to safety guarantees)
             serverLock <- takeMVar servBox
             killThread broadcastTid
             putMVar servBox serverLock
@@ -499,7 +490,6 @@ instance (ToJSON a, FromJSON a, Persist s) => Connection (SelfConnection s c a) 
     let serv' = execState (handleResponse resp) serv
     persist serv' >> writeIORef servRef serv' >> return ()
 
-  -- TODO myId `mod` 2 to determine which RPC to send
   listen (SelfConnection servRef midRef) = do
     serv <- readIORef servRef
     requestInfo midRef serv >>= return . Just . appendEntriesFromLeader serv (logWithIndices serv)
@@ -510,7 +500,6 @@ instance (ToJSON a, FromJSON a, Persist s) => Connection (SelfConnection s c a) 
     return $ SelfConnection serv mid
     where storageName = kLogDir ++ host ++ "_" ++ show port ++ ".local.json"
 
--- TODO get rid of this
 instance Show a => Show (SelfConnection s c a) where
          show (SelfConnection servRef _) = show . unsafePerformIO . readIORef $ servRef
 

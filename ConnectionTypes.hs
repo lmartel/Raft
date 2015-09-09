@@ -62,19 +62,18 @@ instance Connection SimpleNetworkConnection where
   respond msg (SimpleNetworkConnection _ host portNum) = Network.sendTo host portNum . show . encode $ msg
   listen (SimpleNetworkConnection _ host portNum) = liftM (decode . read) $ Network.recvFrom host portNum
 
-data HandleConnection = HandleConnection ServerId Handle
+data HandleConnection = HandleConnection Handle
                       deriving Show
 
 instance Connection HandleConnection where
   fromConfig (CohortConfig sid host portNum) = do
     putStrLn ("Connecting to follower at " ++ host ++ ":" ++ show portNum)
     hdl <- connectTo host . PortNumber . fromIntegral $ portNum
-    return . HandleConnection sid $ hdl
+    return . HandleConnection $ hdl
 
   request msg net = respond msg net >> ConnectionTypes.listen net
-  respond msg (HandleConnection _ hdl) = hPrint hdl (encode msg)
-  listen (HandleConnection _ hdl) = decode . read <$> hGetLine hdl
-
+  respond msg (HandleConnection hdl) = hPrint hdl (encode msg)
+  listen (HandleConnection hdl) = decode . read <$> hGetLine hdl
 
 
 class ClientConnection c where
