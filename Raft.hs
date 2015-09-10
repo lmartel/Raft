@@ -23,7 +23,6 @@ import System.IO
 import Network.Socket hiding (listen)
 import qualified Network.Socket as Sock (listen)
 
-
 import Test.HUnit
 
 import RaftTypes
@@ -31,6 +30,7 @@ import MessageTypes
 import ConnectionTypes
 import JsonStorage
 import Config
+import Debug
 
 --- Initialization
 
@@ -329,7 +329,7 @@ followerMain serv0 = do
           hdl <- debug "Worker thread listening..." $ socketToHandle sock' ReadWriteMode
           hSetBuffering hdl NoBuffering
 
-          newListener <- forkIO . forever $ listenAndRespond servState (HandleConnection hdl)
+          newListener <- forkIO . forever $ listenAndRespond servState (SimpleHandleConnection hdl)
           snocQueue listenersQueue newListener
 
           spawnLoop sock servState listenersQueue
@@ -467,15 +467,6 @@ testMain myId = do
 
 assertAllEqual :: (Eq a, Show a) => String -> a -> [a] -> Assertion
 assertAllEqual msg expected = mapM_ (assertEqual msg expected)
-
-{-# NOINLINE debug #-}
-debug :: String -> a -> a
-debug err dat = unsafePerformIO (putStrLn err) `seq` dat
--- debug _ = id
-
-{-# NOINLINE debug' #-}
-debug' :: Show a => a -> a
-debug' dat = unsafePerformIO (print dat) `seq` dat
 
 data SelfConnection s c a = SelfConnection (IORef (Server s c a)) (IORef MessageId)
 

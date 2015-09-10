@@ -9,18 +9,23 @@ import Data.Aeson
 
 import System.Posix.Signals
 import System.IO
+import System.IO.Error
 import Network
 import Network.Socket
-
+import Control.Exception
+import GHC.IO.Exception
 
 import RaftTypes
 import MessageTypes
 import Config
+import Debug
 
 class Connection c where
-  request :: Message -> c -> IO (Maybe Message)
   respond :: Message -> c -> IO ()
   listen :: c -> IO (Maybe Message)
+
+  request :: Message -> c -> IO (Maybe Message)
+  request msg net = respond msg net >> ConnectionTypes.listen net
 
   fromConfig :: CohortConfig -> IO c
 
@@ -28,10 +33,9 @@ data NilConnection = NilConnection
                    deriving Show
 
 instance Connection NilConnection where
-  request _ _ = return Nothing
   respond _ _ = return ()
-
   listen _ = return Nothing
+
   fromConfig _ = return NilConnection
 
 data FakeConnection = FakeConnection | FakePartition
@@ -58,22 +62,89 @@ data SimpleNetworkConnection = SimpleNetworkConnection ServerId HostName PortID
 instance Connection SimpleNetworkConnection where
   fromConfig (CohortConfig sid host portNum) = pure $ SimpleNetworkConnection sid host (PortNumber . fromIntegral $ portNum)
 
-  request msg net = respond msg net >> ConnectionTypes.listen net
   respond msg (SimpleNetworkConnection _ host portNum) = Network.sendTo host portNum . show . encode $ msg
   listen (SimpleNetworkConnection _ host portNum) = liftM (decode . read) $ Network.recvFrom host portNum
 
-data HandleConnection = HandleConnection Handle
-                      deriving Show
+
+data SimpleHandleConnection = SimpleHandleConnection Handle
+                            deriving Show
+
+instance Connection SimpleHandleConnection where
+  fromConfig = undefined
+
+  respond msg (SimpleHandleConnection hdl) = respondMaybe' msg (Just hdl)
+  listen (SimpleHandleConnection hdl) = listenMaybe' (Just hdl)
+
+
+-- Handle with reconnection capability
+data HandleConnection = HandleConnection CohortConfig (IORef (Maybe Handle))
+
+instance Show HandleConnection where
+  show (HandleConnection conf _) = "HandleConnection " ++ show conf
+
+
+
+-- retryOnceHandle :: HandleConnection -> (Handle -> IO (Maybe a) -> IO (Maybe a)
+-- retryOnceHandle conn@(HandleConnection conf hdlRef) ioFn = do
+--   ioFn `catch` (\ex -> do
+--                    debugConnectError ex
+--                    mHdl' <- connectHandle conn
+--                    ioFn <$> mHdl'
+--                )
+
+debugConnectError :: CohortConfig -> IOError -> IO ()
+debugConnectError conf ex
+  -- Connection refused.
+  | isDoesNotExistError ex                 = debug ("Cannot connect to " ++ followerInfo) return ()
+  | ioeGetErrorType ex == ResourceVanished = debug (followerInfo ++ "disconnected.") return ()
+  | otherwise                              = error ("Unknown connection error: " ++ show ex)
+  where followerInfo = "Follower " ++ show (view cohortId conf)
+                       ++ " (" ++ show (view cohortHostname conf)
+                       ++ ":" ++ show (view cohortPort conf)
+                       ++ ")"
+
+connectHandle :: CohortConfig -> IO (Maybe Handle)
+connectHandle conf@(CohortConfig _ host portNum) = catch (fmap Just . connectTo host . PortNumber . fromIntegral $ portNum)
+                                                   (\ex -> debugConnectError conf ex >> return Nothing)
+
+connectMaybe :: HandleConnection -> IO ()
+connectMaybe (HandleConnection conf handleRef) = do
+  mHdl <- readIORef handleRef
+  hdl' <- case mHdl of
+             Nothing -> connectHandle conf
+             (Just hdl) -> return . Just $ hdl
+  writeIORef handleRef hdl'
+
+-- Try to send.
+-- If exception: throw away connection. Do not (immediately) reconnect.
+respondMaybe :: Message -> HandleConnection -> IO ()
+respondMaybe msg conn@(HandleConnection conf hdlRef) = do
+  mHdl <- readIORef hdlRef
+  respondMaybe' msg mHdl `catch` (\ex -> debugConnectError conf ex >> writeIORef hdlRef Nothing)
+
+respondMaybe' :: Message -> Maybe Handle -> IO ()
+respondMaybe' _ Nothing = return ()
+respondMaybe' msg (Just hdl') = hPrint hdl' (encode msg)
+
+listenMaybe :: HandleConnection -> IO (Maybe Message)
+listenMaybe conn@(HandleConnection conf hdlRef) = do
+  mHdl <- readIORef hdlRef
+  listenMaybe' mHdl
+
+listenMaybe' :: Maybe Handle -> IO (Maybe Message)
+listenMaybe' Nothing = return Nothing
+listenMaybe' (Just hdl) = decode . read <$> hGetLine hdl
 
 instance Connection HandleConnection where
-  fromConfig (CohortConfig sid host portNum) = do
+  fromConfig conf@(CohortConfig _ host portNum) = do
     putStrLn ("Connecting to follower at " ++ host ++ ":" ++ show portNum)
-    hdl <- connectTo host . PortNumber . fromIntegral $ portNum
-    return . HandleConnection $ hdl
+    HandleConnection conf <$> (connectHandle conf >>= newIORef)
 
-  request msg net = respond msg net >> ConnectionTypes.listen net
-  respond msg (HandleConnection hdl) = hPrint hdl (encode msg)
-  listen (HandleConnection hdl) = decode . read <$> hGetLine hdl
+  respond msg conn = connectMaybe conn >> respondMaybe msg conn
+  listen conn = connectMaybe conn >> listenMaybe conn
+
+  -- override `request` : should only try to connect once. If request fails, shouldn't listen for response.
+  request msg conn = connectMaybe conn >> respondMaybe msg conn >> listenMaybe conn
 
 
 class ClientConnection c where
