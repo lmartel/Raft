@@ -119,8 +119,8 @@ broadcastUntil fn = broadcastUntil' . map Right
 
 handleRequest :: FromJSON a => Message -> Raft s c a Message
 handleRequest msg = case view msgType msg of
-  AppendEntries -> processAppendEntries msg
-  RequestVote -> undefined
+  AppendEntries -> debug' "AppendEntries. " $ processAppendEntries msg
+  RequestVote -> debug' "RequestVote." $ undefined
 
 handleResponse :: FromJSON a => Message -> Raft s c a ()
 handleResponse msg = do
@@ -148,7 +148,7 @@ handleResponse msg = do
 handleAppendEntriesResponse :: Message -> Bool -> Raft s c a ()
 handleAppendEntriesResponse msg False = do
   me <- get
-  put $ over nextIndex (fmap $ Map.insertWith (\_ old -> old - 1) (view (info.msgFrom) msg) (1 + view commitIndex me)) me
+  put $ over nextIndex (fmap $ Map.insertWith (\_ old -> max (old - 1) 0) (view (info.msgFrom) msg) (1 + view commitIndex me)) me
 
 
 handleAppendEntriesResponse msg True = do
@@ -200,13 +200,13 @@ processAppendEntries msg = do
   me <- get
   case validateAppendEntries me msg of
    Nothing -> do put me
-                 return (response False me)
+                 debug "Failed validation." $ return (response False me)
    (Just entrs) -> let me' = set currentTerm (fromJust $ term msg)
                              . over log (updateLogWith entrs)
                              . set commitIndex (updateCommitIndex me $ leaderCommit msg)
                              $ me
                    in do put me'
-                         return (response True me')
+                         debug "Succeeded!" $ return (response True me')
   where updateCommitIndex :: Server s c a -> Maybe LogIndex -> LogIndex
         updateCommitIndex me Nothing = view commitIndex me
         updateCommitIndex me (Just theirs) = min theirs (viewLastLogIndex me)
@@ -237,8 +237,8 @@ processAppendEntries msg = do
 
 validateAppendEntries :: FromJSON a => Server s c a -> Message -> Maybe [IndexedEntry a]
 validateAppendEntries serv msg =  case Just . all (== True) =<< sequence [
-  term msg >>= Just . (>= view currentTerm serv),
-  noPrevLogEntries `maybeOr` prevLogEntryMatches
+  debugUnlessM "Term too old. " $ (>= view currentTerm serv) <$> term msg,
+  debugUnlessM "Mismatched term at prev index. " $ noPrevLogEntries `maybeOr` prevLogEntryMatches
   ] of
                                   (Just True) -> entries msg
                                   _ -> Nothing
@@ -348,7 +348,7 @@ snocQueue q v = takeMVar q >>= putMVar q . (v :)
 listenAndRespond :: (Persist s, Connection conn, FromJSON a, ToJSON a) => MVar (Server s c a) -> conn -> IO ()
 listenAndRespond servBox conn = do
   maybeReq <-  listen conn
-  case debug "Worker thread received request." maybeReq of
+  case debug' "Received request... " maybeReq of
    Nothing -> return ()
    (Just req) -> do
      serv <- takeMVar servBox
@@ -417,6 +417,12 @@ main = do
   case args of
    (myId:"test":_) -> testMain . fromIntegral . read $ myId
 
+   (myId:"log":_) -> do
+     let sid = fromIntegral . read $ myId
+     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig JsonStorage NilConnection String)
+     lg <- view log <$> (fromPersist . initializeFollower $ conf)
+     logMain sid lg
+
    (myId:"leader":_) -> do
      let sid = fromIntegral . read $ myId
      conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig JsonStorage HandleConnection String)
@@ -434,6 +440,15 @@ main = do
 
 
 -- Testing and testing utils
+
+logMain :: Show a => ServerId -> Log a -> IO ()
+logMain sid log = do
+  putStrLn $ "Inspecting log for " ++ show sid
+  putStrLn $ "Total entries: " ++ (show . length . view logEntries $ log)
+  mapM_ (putStrLn . ppLogEntry) (withIndices log)
+      where ppLogEntry :: Show a => (LogIndex, LogEntry a) -> String
+            ppLogEntry (i, LogEntry trm dat) = show i ++ " | " ++ show trm ++ " | " ++ show dat
+
 
 testMain :: ServerId -> IO ()
 testMain myId = do

@@ -83,15 +83,6 @@ instance Show HandleConnection where
   show (HandleConnection conf _) = "HandleConnection " ++ show conf
 
 
-
--- retryOnceHandle :: HandleConnection -> (Handle -> IO (Maybe a) -> IO (Maybe a)
--- retryOnceHandle conn@(HandleConnection conf hdlRef) ioFn = do
---   ioFn `catch` (\ex -> do
---                    debugConnectError ex
---                    mHdl' <- connectHandle conn
---                    ioFn <$> mHdl'
---                )
-
 debugConnectError :: CohortConfig -> IOError -> IO ()
 debugConnectError conf ex
   -- Connection refused.
@@ -157,7 +148,7 @@ newTestSIClient :: IO (SimpleIncrementingClient String)
 newTestSIClient = SIClient (\i -> "Log Entry: spacedate " ++ show i) <$> newIORef 1
 
 instance ClientConnection SimpleIncrementingClient where
-  getLogEntry (SIClient convert ctr) = threadDelay 333000 >> convert <$> atomicModifyIORef ctr (\i -> (i + 1, i))
+  getLogEntry (SIClient convert ctr) = threadDelay 1500000 >> convert <$> atomicModifyIORef ctr (\i -> (i + 1, i))
   committed x _ = putStrLn $ "!! COMMITTED `" ++ show x ++ "`"
 
 
