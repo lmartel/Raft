@@ -56,6 +56,9 @@ promoteToLeader base = set (config.role) Leader . set nextIndex (Just nis) . set
         mis :: ServerMap LogIndex
         mis = Map.map (\_ -> LogIndex 0) . view (config.cohorts) $ base
 
+nominateToCandidate :: Server s c a -> Server s c a
+nominateToCandidate = set (config.role) (Candidate Map.empty) . demoteToFollower
+
 demoteToFollower :: Server s c a -> Server s c a
 demoteToFollower = set (config.role) Follower . set nextIndex Nothing . set matchIndex Nothing
 
@@ -118,7 +121,7 @@ handleRequest :: FromJSON a => Message -> Raft s c a (Maybe Message)
 handleRequest msg = case view msgType msg of
   AppendEntries -> debug' "AppendEntries. " (Just <$> processAppendEntries msg)
   AppendEntriesResponse -> debug' "AppendEntriesResponse." (handleResponse msg >> return Nothing)
-  RequestVote -> debug' "RequestVote." undefined
+  RequestVote -> debug' "RequestVote." (Just <$> processRequestVote msg)
 
 handleResponse :: FromJSON a => Message -> Raft s c a ()
 handleResponse msg = do
@@ -191,7 +194,19 @@ majorityMatched n serv = case view matchIndex serv of
                > Map.size mp
 
 handleRequestVoteResponse :: Message -> Bool -> Raft s c a ()
-handleRequestVoteResponse = undefined
+handleRequestVoteResponse resp vote = do
+  me <- get
+  case view (config.role) me of
+   (Candidate votes) -> let votes' = Map.insert (view (msgInfo.msgFrom) resp) vote votes
+                            me' = set (config.role) (Candidate votes') me
+                        in do put me'
+                              if wasElected votes' me'
+                                then return ()
+                                else return ()
+   _ -> return ()
+  where wasElected :: ServerMap Bool -> Server s c a -> Bool
+        wasElected votes me = 2 * (Map.size . Map.filter (== True) $ votes)
+                              > ((+ 1) . Map.size $ view (config.cohorts) me)
 
 processAppendEntries :: FromJSON a => Message -> Raft s c a Message
 processAppendEntries msg = do
@@ -248,6 +263,38 @@ validateAppendEntries serv msg =  case Just . all (== True) =<< sequence [
         maybeOr (Just True) _ = Just True
         maybeOr _ b2 = b2
 
+processRequestVote :: FromJSON a => Message -> Raft s c a Message
+processRequestVote msg = do
+  me <- get
+  case validateRequestVote me msg of
+   Nothing -> debug "Failed validation." $ return (response False me)
+   (Just cid) -> let me' = set currentTerm (fromJust $ term msg)
+                           . set votedFor (Just cid)
+                           $ me
+                 in do put me'
+                       debug "Succeeded!" $ return (response True me')
+  where response :: Bool -> Server s c a -> Message
+        response b me = requestVoteResponse (view currentTerm me) b $ responseInfo msg me
+
+
+validateRequestVote :: FromJSON a => Server s c a -> Message -> Maybe ServerId
+validateRequestVote serv msg = case Just . all (== True) =<< sequence [
+  debugUnlessM "Already voted for another candidate." $ canVote (view votedFor serv) <$> candidateId msg,
+  debugUnlessM "Term too old." $ (>= view currentTerm serv) <$> term msg,
+  debugUnlessM "Candidate log out of date." $ candidateLogFresh <$> lastLogIndex msg <*> lastLogTerm msg
+  ] of
+                                (Just True) -> candidateId msg
+                                _ -> Nothing
+  where canVote Nothing _ = False
+        canVote (Just vid) cid = vid == cid
+
+        localTerm = view currentTerm serv
+
+        candidateLogFresh :: LogIndex -> Term -> Bool
+        candidateLogFresh cLogIndex cLogTerm
+          | cLogTerm > localTerm  = True
+          | cLogTerm == localTerm = cLogIndex >= viewLastLogIndex serv
+          | otherwise             = False
 --- Startup and main
 
 kConfigDir :: String
@@ -310,8 +357,10 @@ type ServerListener s c a = Handle -> ServerWorker s c a
 -- takeMVar' :: MVar a -> IO a
 -- takeMVar' mv = fromJust <$> tryTakeMVar mv
 
-withListeners :: Show a => Server s c a -> ServerListener s c a -> [ServerWorker s c a] -> IO (Server s c a)
-withListeners serv0 acceptFn otherFns = do
+withListeners :: (ClientConnection cli, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
+                 cli a -> Server s c a -> ServerListener s c a -> [ServerWorker s c a] -> IO (Server s c a)
+withListeners client serv0 acceptFn otherFns = do
+  let initialRole = view (config.role) serv0
   serverState <- newEmptyMVar
   workerThreads <- newMVar []
   allDone <- newEmptyMVar
@@ -331,24 +380,28 @@ withListeners serv0 acceptFn otherFns = do
   mapM_ (\f -> forkIO (f serverState) >>= snocQueue workerThreads) otherFns
   putMVar serverState serv0
   takeMVar allDone
-  takeMVar serverState
-    where spawnerThread sock serverState workerThreads = do
-            (sock', _) <- accept sock
-            hdl <- debug "Listener accepted connection." $ socketToHandle sock' ReadWriteMode
-            hSetBuffering hdl NoBuffering
+  cleanupAndExit serverState workerThreads allDone
+  close sock -- TODO figure out how to close properly and uninstall keyboard handler, or just recycle them
+  serv' <- takeMVar serverState
+  let newRole = view (config.role) serv'
+    in if initialRole /= newRole
+       then debug ("Restaring with new role: " ++ show newRole) mainForRole client serv'
+       else return serv'
+  where spawnerThread sock serverState workerThreads = do
+          (sock', _) <- accept sock
+          hdl <- debug "Listener accepted connection." $ socketToHandle sock' ReadWriteMode
+          hSetBuffering hdl NoBuffering
 
-            snocQueue workerThreads =<< forkIO (acceptFn hdl serverState)
-            spawnerThread sock serverState workerThreads
+          snocQueue workerThreads =<< forkIO (acceptFn hdl serverState)
+          spawnerThread sock serverState workerThreads
 
 cleanupAndExit :: (Show a) => MVar (Server s c a) -> MVar [ThreadId] -> MVar () -> IO ()
 cleanupAndExit serverState workersQueue done = do
   serverLock <- debug "Cleaning up..." $ takeMVar serverState
   mapM killThread <$> takeMVar workersQueue
+  putMVar workersQueue []
   putMVar serverState serverLock
   debug "Workers killed." $ putMVar done ()
-
-followerMain :: (Persist s, Connection c, FromJSON a, ToJSON a, Show a) => Server s c a -> IO (Server s c a)
-followerMain serv0 = withListeners serv0 (listenerFromHandle listenForRequestOnce) []
 
 snocQueue :: MVar [a] -> a -> IO ()
 snocQueue q v = takeMVar q >>= putMVar q . (++ [v])
@@ -370,6 +423,8 @@ listenForSomethingOnce shouldHandle conn servBox = do
                 serv <- takeMVar servBox
                 let (resp, serv') = runState (handleRequest req) serv
                 persist serv'
+                let newCommits = mapMaybe (flip entry $ view log serv) [1 + view commitIndex serv .. view commitIndex serv']
+                mapM_ (flip committed cli . view entryData) newCommits -- TODO move client into server.config
                 putMVar servBox serv'
                 maybe noop (`respond` conn) resp
             | otherwise = debug ("Suppressing unexpected message of type " ++ show (view msgType req)) noop
@@ -385,22 +440,47 @@ listenForResponseOnce conn serv = do
   listenForSomethingOnce (isResponse . view msgType) conn serv
   listenForResponseOnce conn serv
 
-leaderMain :: (ClientConnection cli, Persist s, Connection c) => cli String -> Server s c String -> IO (Server s c String)
--- leaderMain cli serv0 = withListeners serv0 (listenerFromHandle listenForRequestOnce) (broadcastThread cli : cohortListeners serv0)
---leaderMain cli serv0 = withListeners serv0 (listenerFromHandle listenForRequestOnce) (broadcastThread cli : selfListener)
-leaderMain cli serv0 = withListeners serv0 (listenerFromHandle listenForRequestOnce) (broadcastThread cli : selfListener ++ cohortListeners serv0)
-  where selfListener :: (Persist s, ToJSON a, FromJSON a) => [ServerWorker s c a]
-        selfListener = case view (config.ownFollower) serv0 of
-                        Nothing -> []
-                        (Just self) -> [\servBox -> forever $ listenForResponseOnce (selfConnection servBox self) servBox]
 
-        cohortConnections :: Server s c a -> [c]
+--- Main functions for each role
+
+mainForRole :: (ClientConnection cli, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
+               cli a -> Server s c a -> IO (Server s c a)
+mainForRole cli serv0 = case view (config.role) serv0 of
+  Follower -> followerMain cli serv0
+  Leader -> leaderMain cli serv0
+  (Candidate _) -> candidateMain cli serv0
+
+
+followerMain :: (ClientConnection cli, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
+                cli a -> Server s c a -> IO (Server s c a)
+followerMain cli serv0 = withListeners cli serv0 (listenerFromHandle listenForRequestOnce) []
+
+candidateMain ::  (ClientConnection cli, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
+                  cli a -> Server s c a -> IO (Server s c a) -- TODO: after successful request, downgrade Role
+candidateMain cli serv0 = withListeners cli serv0
+                          (listenerFromHandle listenForRequestOnce)
+                          (voteForMe : selfListener serv0 ++ cohortListeners serv0)
+  where voteForMe = undefined
+
+
+leaderMain :: (ClientConnection cli, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
+              cli a -> Server s c a -> IO (Server s c a)
+leaderMain cli serv0 = withListeners cli serv0
+                       (listenerFromHandle listenForRequestOnce)
+                       (broadcastThread cli : selfListener serv0 ++ cohortListeners serv0)
+
+selfListener :: (Persist s, ToJSON a, FromJSON a) => Server s c a -> [ServerWorker s c a]
+selfListener serv0 = case view (config.ownFollower) serv0 of
+                Nothing -> []
+                (Just self) -> [\servBox -> forever $ listenForResponseOnce (selfConnection servBox self) servBox]
+
+
+cohortListeners :: (Persist s, Connection c, ToJSON a, FromJSON a) => Server s c a -> [ServerWorker s c a]
+cohortListeners serv = map listenForResponseOnce $ cohortConnections serv
+  where cohortConnections :: Server s c a -> [c]
         cohortConnections = map snd . Map.toList . view (config.cohorts)
 
-        cohortListeners :: (Persist s, Connection c) => Server s c String -> [ServerWorker s c String]
-        cohortListeners serv = map listenForResponseOnce $ cohortConnections serv
-
-broadcastThread :: (ClientConnection cli, Connection c) => cli String -> MVar (Server s c String) -> IO ()
+broadcastThread :: (ClientConnection cli, Connection c, ToJSON a, FromJSON a) => cli a -> MVar (Server s c a) -> IO ()
 broadcastThread cli servBox = do
   nextMessageId <- newIORef 0 -- TODO: need to persist nextMessageId?
   serv0 <- takeMVar servBox
@@ -409,7 +489,7 @@ broadcastThread cli servBox = do
   putMVar servBox serv'
   leaderLoop nextMessageId cli servBox
 
-leaderLoop :: (ClientConnection cli, Connection c) => IORef MessageId -> cli String -> MVar (Server s c String) -> IO ()
+leaderLoop :: (ClientConnection cli, Connection c, ToJSON a, FromJSON a) => IORef MessageId -> cli a -> MVar (Server s c a) -> IO ()
 leaderLoop nextMid cli servBox = do
   nextLogEntry <- getLogEntry cli
   serv <- takeMVar servBox
@@ -423,19 +503,13 @@ leaderLoop nextMid cli servBox = do
   putMVar servBox serv'
   respond selfUpdate $ selfConnection servBox self
 
-  -- TODO check for new commits in the right place
-  -- let newCommits = mapMaybe (flip entry $ view log serv) [1 + view commitIndex serv .. view commitIndex serv']
-  -- mapM_ (flip committed cli . view entryData) newCommits
   leaderLoop nextMid cli servBox
-
--- TODO move this to the commit-checker
-majoritySuccessful :: [Message] -> Bool
-majoritySuccessful resps = True -- (\resps -> length (filter wasSuccessful resps) > nCohorts / 2)
 
 
 main :: IO ()
 main = do
   args <- getArgs
+  client <- newTestSIClient
   case args of
    (myId:"test":_) -> testMain . fromIntegral . read $ myId
 
@@ -449,14 +523,13 @@ main = do
      let sid = fromIntegral . read $ myId
      conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig JsonStorage HandleConnection String)
      serv <- fromPersist . initializeFollower $ conf
-     client <- newTestSIClient
      void $ debugMain (leaderMain client) (promoteToLeader serv)
 
    (myId:_) -> do
      let sid = fromIntegral . read $ myId
      conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig JsonStorage NilConnection String)
      serv <- fromPersist . initializeFollower $ conf
-     void $ debugMain followerMain serv
+     void $ debugMain (followerMain client) serv
 
    _ -> error "Invalid arguments."
 
@@ -550,7 +623,6 @@ testLocalSystemWith lg myId = do
   let serv = initializeFollower conf
   case view role conf of
    Leader -> leaderMain AbortClient . injectPersistentState (1, Just myId, lg) . promoteToLeader $ serv
-   Follower -> followerMain serv
 
 
 writeTestConfig :: ClusterConfig -> IO ()

@@ -20,8 +20,6 @@ import Data.Text.Lazy.Encoding
 import qualified Data.Text.Lazy as Text
 import qualified Data.ByteString.Lazy as BS
 
-data Role = Booting | Leader | Follower | Candidate
-          deriving (Eq, Show)
 
 newtype MessageId = MessageId Integer
                   deriving (Eq, Ord, Show, Num, Enum, Generic)
@@ -31,6 +29,17 @@ newtype ServerId = ServerId Integer
                  deriving (Eq, Ord, Show, Num, Enum, Generic)
 newtype LogIndex = LogIndex Integer
                  deriving (Eq, Ord, Show, Num, Enum, Generic)
+
+type ServerMap a = Map ServerId a
+
+data Role = Booting | Leader | Follower | Candidate (ServerMap Bool)
+          deriving Show
+
+instance Eq Role where
+  Leader == Leader = True
+  Follower == Follower = True
+  (Candidate _) == (Candidate _) = True
+  _ == _ = False
 
 type Hostname = String
 type Port = Int
@@ -169,7 +178,6 @@ selfConnection self (OwnFollower q qFlag) = SelfConnection self q qFlag
 
 --- Server type
 
-type ServerMap a = Map.Map ServerId a
 data ServerConfig s c e = ServerConfig {
   _role :: Role,
   _ownCohort :: CohortConfig,
