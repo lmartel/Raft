@@ -11,8 +11,10 @@ import qualified Data.Map as Map
 import GHC.Generics
 import Control.Lens
 import Data.Aeson
+import Control.Concurrent
 import Control.Monad.State
 import Control.Monad
+
 import Data.Maybe
 import Data.Text.Lazy.Encoding
 import qualified Data.Text.Lazy as Text
@@ -72,6 +74,16 @@ instance FromJSON NilEntry where
 data MessageType = AppendEntries | AppendEntriesResponse
                  | RequestVote | RequestVoteResponse
                  deriving (Show, Generic)
+
+isRequest :: MessageType -> Bool
+isRequest AppendEntries = True
+isRequest RequestVote = True
+isRequest _ = False
+
+isResponse :: MessageType -> Bool
+isResponse AppendEntriesResponse = True
+isResponse RequestVoteResponse = True
+isResponse _ = False
 
 data MessageInfo = MessageInfo {
   _msgFrom :: ServerId,
@@ -136,12 +148,32 @@ class Persist s where
 
   fromName :: String -> s a
 
+--- Connection types
+
+data OwnFollower = OwnFollower {
+  _of_msgQueue :: MVar [Message],
+  _of_queueNotEmpty :: MVar ()
+  }
+
+newOwnFollower :: IO OwnFollower
+newOwnFollower = OwnFollower <$> newMVar [] <*> newEmptyMVar
+
+data SelfConnection a = SelfConnection {
+  _sc_server :: MVar a,
+  _sc_msgQueue :: MVar [Message],
+  _sc_queueNotEmpty :: MVar ()
+  }
+
+selfConnection :: MVar a -> OwnFollower -> SelfConnection a
+selfConnection self (OwnFollower q qFlag) = SelfConnection self q qFlag
+
 --- Server type
 
 type ServerMap a = Map.Map ServerId a
 data ServerConfig s c e = ServerConfig {
   _role :: Role,
   _ownCohort :: CohortConfig,
+  _ownFollower :: Maybe OwnFollower,
   _cohorts :: ServerMap c,
   _storage :: s e
   }
@@ -161,7 +193,7 @@ data Server s c e = Server {
 
   --- Non-raft state
   _config :: ServerConfig s c e,
-  _outstanding :: Map MessageId (PendingMessage c)
+  _outstanding :: Map MessageId Message
   }
 makeLenses ''Server
 serverId :: Lens' (Server s c e) ServerId
@@ -185,7 +217,6 @@ instance (Show e) => Show (Server s c e) where
 
 
 type Raft s c a v = State (Server s c a) v
-
 
 --- Accessors and helpers
 

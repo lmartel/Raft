@@ -20,6 +20,7 @@ import MessageTypes
 import Config
 import Debug
 
+
 class Connection c where
   respond :: Message -> c -> IO ()
   listen :: c -> IO (Maybe Message)
@@ -56,6 +57,8 @@ instance Connection FakeConnection where
 
   fromConfig _ = return FakeConnection
 
+
+-- Not used, because Network.recvFrom is hard to reuse reliably
 data SimpleNetworkConnection = SimpleNetworkConnection ServerId HostName PortID
                              deriving Show
 
@@ -65,7 +68,8 @@ instance Connection SimpleNetworkConnection where
   respond msg (SimpleNetworkConnection _ host portNum) = Network.sendTo host portNum . show . encode $ msg
   listen (SimpleNetworkConnection _ host portNum) = liftM (decode . read) $ Network.recvFrom host portNum
 
-
+-- Simple connection wrapper for a Handle created from a Socket.
+-- Used by Followers to process requests.
 data SimpleHandleConnection = SimpleHandleConnection Handle
                             deriving Show
 
@@ -76,17 +80,19 @@ instance Connection SimpleHandleConnection where
   listen (SimpleHandleConnection hdl) = listenMaybe' (Just hdl)
 
 
--- Handle with reconnection capability
+-- Handle with reconnection capability.
+-- Used by Leaders to send requests to Followers.
 data HandleConnection = HandleConnection CohortConfig (IORef (Maybe Handle))
 
 instance Show HandleConnection where
   show (HandleConnection conf _) = "HandleConnection " ++ show conf
 
 
-debugConnectError :: CohortConfig -> IOError -> IO ()
-debugConnectError conf ex
+debugConnectError :: Bool -> CohortConfig -> IOError -> IO ()
+debugConnectError verbose conf ex
   -- Connection refused.
-  | isDoesNotExistError ex                 = debug ("Cannot connect to " ++ followerInfo) return ()
+  | isDoesNotExistError ex = when verbose $ debug ("Cannot connect to " ++ followerInfo) return ()
+
   | ioeGetErrorType ex == ResourceVanished = debug (followerInfo ++ "disconnected.") return ()
   | otherwise                              = error ("Unknown connection error: " ++ show ex)
   where followerInfo = "Follower " ++ show (view cohortId conf)
@@ -94,15 +100,15 @@ debugConnectError conf ex
                        ++ ":" ++ show (view cohortPort conf)
                        ++ ")"
 
-connectHandle :: CohortConfig -> IO (Maybe Handle)
-connectHandle conf@(CohortConfig _ host portNum) = catch (fmap Just . connectTo host . PortNumber . fromIntegral $ portNum)
-                                                   (\ex -> debugConnectError conf ex >> return Nothing)
+connectHandle :: Bool -> CohortConfig -> IO (Maybe Handle)
+connectHandle verbose conf@(CohortConfig _ host portNum) = catch (fmap Just . connectTo host . PortNumber . fromIntegral $ portNum)
+                                                           (\ex -> debugConnectError verbose conf ex >> return Nothing)
 
-connectMaybe :: HandleConnection -> IO ()
-connectMaybe (HandleConnection conf handleRef) = do
+connectMaybe :: Bool -> HandleConnection -> IO ()
+connectMaybe verbose (HandleConnection conf handleRef) = do
   mHdl <- readIORef handleRef
   hdl' <- case mHdl of
-             Nothing -> connectHandle conf
+             Nothing -> connectHandle verbose conf
              (Just hdl) -> return . Just $ hdl
   writeIORef handleRef hdl'
 
@@ -111,7 +117,7 @@ connectMaybe (HandleConnection conf handleRef) = do
 respondMaybe :: Message -> HandleConnection -> IO ()
 respondMaybe msg conn@(HandleConnection conf hdlRef) = do
   mHdl <- readIORef hdlRef
-  respondMaybe' msg mHdl `catch` (\ex -> debugConnectError conf ex >> writeIORef hdlRef Nothing)
+  respondMaybe' msg mHdl `catch` (\ex -> debugConnectError False conf ex >> writeIORef hdlRef Nothing)
 
 respondMaybe' :: Message -> Maybe Handle -> IO ()
 respondMaybe' _ Nothing = return ()
@@ -129,13 +135,19 @@ listenMaybe' (Just hdl) = decode . read <$> hGetLine hdl
 instance Connection HandleConnection where
   fromConfig conf@(CohortConfig _ host portNum) = do
     putStrLn ("Connecting to follower at " ++ host ++ ":" ++ show portNum)
-    HandleConnection conf <$> (connectHandle conf >>= newIORef)
+    HandleConnection conf <$> (connectHandle True conf >>= newIORef)
 
-  respond msg conn = connectMaybe conn >> respondMaybe msg conn
-  listen conn = connectMaybe conn >> listenMaybe conn
+  respond msg conn = connectMaybe False conn >> respondMaybe msg conn
+  listen conn = connectMaybe True conn >> listenMaybe conn
 
   -- override `request` : should only try to connect once. If request fails, shouldn't listen for response.
-  request msg conn = connectMaybe conn >> respondMaybe msg conn >> listenMaybe conn
+  request msg conn = connectMaybe True conn >> respondMaybe msg conn >> listenMaybe conn
+
+
+
+
+
+
 
 
 class ClientConnection c where

@@ -5,6 +5,16 @@ import Control.Monad
 
 import RaftTypes
 
+kReconnect :: Int
+-- kReconnect = 200
+kReconnect = 1500
+
+kTimeoutMin :: Int
+kTimeoutMin = 300
+
+kTimeoutMax :: Int
+kTimeoutMax = 500
+
 instance ToJSON CohortConfig where
   toJSON (CohortConfig sid host port) = object [
     "id" .= sid
