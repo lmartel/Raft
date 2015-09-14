@@ -1,11 +1,13 @@
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE BangPatterns #-}
 module Raft where
 import qualified Prelude (log)
 import Prelude hiding (log)
 import System.Environment (getArgs)
-import Control.Concurrent
+import Control.Concurrent hiding (putMVar)
+import qualified Control.Concurrent as LazyConcurrency (putMVar)
 import Control.Lens
 import Control.Monad
 import Control.Exception.Base
@@ -33,9 +35,14 @@ import JsonStorage
 import Config
 import Debug
 
+--- The strict-concurrency package is out-of-date, so we roll our own:
+
+putMVar :: MVar a -> a -> IO ()
+putMVar box !v = LazyConcurrency.putMVar box v
+
 --- Initialization
 
-initializeFollower :: ServerConfig s c a -> Server s c a
+initializeFollower :: ServerConfig cl s c a -> Server cl s c a
 initializeFollower conf = Server {
   _currentTerm = Term 0,
   _votedFor = Nothing,
@@ -49,17 +56,17 @@ initializeFollower conf = Server {
   _outstanding = Map.empty
   }
 
-promoteToLeader :: Server s c a -> Server s c a
+promoteToLeader :: Server cl s c a -> Server cl s c a
 promoteToLeader base = set (config.role) Leader . set nextIndex (Just nis) . set matchIndex (Just mis) $ base
   where nis :: ServerMap LogIndex
         nis = Map.map (\_ -> viewLastLogIndex base) . view (config.cohorts) $ base
         mis :: ServerMap LogIndex
         mis = Map.map (\_ -> LogIndex 0) . view (config.cohorts) $ base
 
-nominateToCandidate :: Server s c a -> Server s c a
+nominateToCandidate :: Server cl s c a -> Server cl s c a
 nominateToCandidate = set (config.role) (Candidate Map.empty) . demoteToFollower
 
-demoteToFollower :: Server s c a -> Server s c a
+demoteToFollower :: Server cl s c a -> Server cl s c a
 demoteToFollower = set (config.role) Follower . set nextIndex Nothing . set matchIndex Nothing
 
 --- Sending/receiving messages
@@ -70,13 +77,13 @@ atomicGetNextMessageId ref = atomicModifyIORef ref (\mid -> (mid + 1, mid))
 atomicGetNextMessageIds :: Int -> IORef MessageId -> IO [MessageId]
 atomicGetNextMessageIds n ref = atomicModifyIORef ref (\mid -> (mid + fromIntegral n, take n [mid..]))
 
-requestInfo :: IORef MessageId -> Server s c a -> IO MessageInfo
+requestInfo :: IORef MessageId -> Server cl s c a -> IO MessageInfo
 requestInfo midRef serv = MessageInfo (view serverId serv) <$> atomicGetNextMessageId midRef
 
-responseInfo :: Message -> Server s c a -> MessageInfo
+responseInfo :: Message -> Server cl s c a -> MessageInfo
 responseInfo req serv = MessageInfo (view serverId serv) (view (info.msgId) req)
 
-broadcast :: Connection c => IORef MessageId -> BaseMessage -> Server s c a -> IO (Server s c a)
+broadcast :: Connection c => IORef MessageId -> BaseMessage -> Server cl s c a -> IO (Server cl s c a)
 broadcast midRef msg serv
   | view (config.role) serv /= Leader = return serv
   | otherwise = do
@@ -88,7 +95,7 @@ broadcast midRef msg serv
         prepareMessage c mid = (c, msg $ MessageInfo (view serverId serv) mid)
         sendPending = uncurry . flip $ respond
 
-expectResponsesTo :: [Message] -> Raft s c a ()
+expectResponsesTo :: [Message] -> Raft cl s c a ()
 expectResponsesTo msgs = get >>= put . over outstanding multiInsert
   where multiInsert msgMap = foldl singleInsert msgMap msgs
         singleInsert :: Map MessageId Message -> Message -> Map MessageId Message
@@ -97,7 +104,7 @@ expectResponsesTo msgs = get >>= put . over outstanding multiInsert
 
 --- Sending messages from Leader to self-as-Follower
 
-instance (ToJSON a, FromJSON a) => Connection (SelfConnection (Server s c a)) where
+instance (ToJSON a, FromJSON a, Show a) => Connection (SelfConnection (Server cl s c a)) where
   fromConfig = undefined
 
   respond msg (SelfConnection servBox respQ qNotEmpty) = do
@@ -117,13 +124,12 @@ instance (ToJSON a, FromJSON a) => Connection (SelfConnection (Server s c a)) wh
 
 --- Raft algorithm core
 
-handleRequest :: FromJSON a => Message -> Raft s c a (Maybe Message)
+handleRequest :: (FromJSON a) => Message -> Raft cl s c a (Maybe Message)
 handleRequest msg = case view msgType msg of
   AppendEntries -> debug' "AppendEntries. " (Just <$> processAppendEntries msg)
-  AppendEntriesResponse -> debug' "AppendEntriesResponse." (handleResponse msg >> return Nothing)
   RequestVote -> debug' "RequestVote." (Just <$> processRequestVote msg)
 
-handleResponse :: FromJSON a => Message -> Raft s c a ()
+handleResponse :: (ClientConnection cl a, FromJSON a, Show a) => Message -> Raft cl s c a ()
 handleResponse msg = do
   let maybeMalformed = [
         liftM checkOutOfDate (term msg),
@@ -132,21 +138,23 @@ handleResponse msg = do
   case sequence maybeMalformed of
    Nothing -> return ()
    (Just states) -> sequence_ states
-  where checkOutOfDate :: Term -> Raft s c a ()
+  where checkOutOfDate :: Term -> Raft cl s c a ()
         checkOutOfDate followerTerm = do
              me <- get
              if view currentTerm me < followerTerm
                then put . set currentTerm followerTerm . demoteToFollower $ me
                else put me
 
-        handleResponse' :: Maybe (Raft s c a ())
+        handleResponse' :: (ClientConnection cl a, FromJSON a, Show a) => Maybe (Raft cl s c a ())
         handleResponse' = case view msgType msg of
-                           AppendEntriesResponse -> liftM (handleAppendEntriesResponse msg) $ success msg
-                           RequestVoteResponse -> liftM (handleRequestVoteResponse msg) $ voteGranted msg
+                           AppendEntriesResponse -> debug' "AppendEntriesResponse." $
+                                                    liftM (handleAppendEntriesResponse msg) (success msg)
+                           RequestVoteResponse -> debug' "RequestVoteResponse." $
+                                                  liftM (handleRequestVoteResponse msg) $ voteGranted msg
 
 -- On failure: decrement nextIndex, retry later
 -- On success: update matchIndex and nextIndex, then resolve (delete) the pending message.
-handleAppendEntriesResponse :: Message -> Bool -> Raft s c a ()
+handleAppendEntriesResponse :: (ClientConnection cl a, Show a) => Message -> Bool -> Raft cl s c a ()
 handleAppendEntriesResponse msg False = do
   me <- get
   put $ over nextIndex (fmap $ Map.insertWith (\_ old -> max (old - 1) 0) (view (info.msgFrom) msg) (1 + view commitIndex me)) me
@@ -176,39 +184,54 @@ handleAppendEntriesResponse msg True = do
         lastSentIndex :: [(LogIndex, LogEntry NilEntry)] -> Maybe LogIndex
         lastSentIndex = fmap last . sentIndices
 
-checkCommitted :: Maybe [LogIndex] -> Server s c a -> Server s c a
-checkCommitted Nothing = id
-checkCommitted (Just x) = checkCommitted' x
-  where checkCommitted' [] serv = serv
-        checkCommitted' (n:ns) serv = if n > view commitIndex serv
-                                         && majorityMatched n serv
-                                         && termAtIndex n serv == Just (view currentTerm serv)
-                                      then checkCommitted' ns . set commitIndex n $ serv
-                                      else serv
+-- This reports to the client that newly-committed entries are committed.
+-- This is safe to do immediately, because "committed" means the entry has been written to
+--     disk by a majority of followers;
+-- The leader does not need to persist anything to make the commit "official."
+
+-- TODO: refactor with Monad transformers to allow a "committed" client IO callback here.
+checkCommitted :: (ClientConnection cl a, Show a) => Maybe [LogIndex] -> Server cl s c a -> Server cl s c a
+checkCommitted Nothing serv0 = serv0
+checkCommitted (Just xs) serv0 = let toCommit = filter (canCommit serv0) xs in
+                                  over commitIndex (\old -> foldl max old toCommit) serv0
+  where canCommit :: Server cl s c a -> LogIndex -> Bool
+        canCommit serv n = n > view commitIndex serv
+                           && majorityMatched n serv
+                           && termAtIndex n serv == Just (view currentTerm serv)
+
+        doCommits :: (ClientConnection cl a, Show a) => Server cl s c a -> [LogIndex] -> IO ()
+        doCommits serv ns = mapM_ (commitTo serv) (debugPrint $ getEntriesForIndices serv ns)
+
+        getEntriesForIndices :: Show a => Server cl s c a -> [LogIndex] -> [LogEntry a]
+        getEntriesForIndices serv = mapMaybe (flip entry $ view log serv)
+
+        commitTo :: (ClientConnection cl a, Show a) => Server cl s c a -> LogEntry a -> IO ()
+        commitTo serv entr = view entryData entr `committed` view (config.client) serv
 
 
-majorityMatched :: LogIndex -> Server s c a -> Bool
+
+majorityMatched :: LogIndex -> Server cl s c a -> Bool
 majorityMatched n serv = case view matchIndex serv of
   Nothing -> False
   (Just mp) -> 2 * Map.size (Map.filter (>= n) mp)
                > Map.size mp
 
-handleRequestVoteResponse :: Message -> Bool -> Raft s c a ()
+handleRequestVoteResponse :: Message -> Bool -> Raft cl s c a ()
 handleRequestVoteResponse resp vote = do
   me <- get
   case view (config.role) me of
    (Candidate votes) -> let votes' = Map.insert (view (msgInfo.msgFrom) resp) vote votes
                             me' = set (config.role) (Candidate votes') me
-                        in do put me'
-                              if wasElected votes' me'
-                                then return ()
-                                else return ()
+                        in put me'
+                           --   if wasElected votes' me'
+                             --   then return () -- TODO
+                               -- else return ()
    _ -> return ()
-  where wasElected :: ServerMap Bool -> Server s c a -> Bool
+  where wasElected :: ServerMap Bool -> Server cl s c a -> Bool
         wasElected votes me = 2 * (Map.size . Map.filter (== True) $ votes)
                               > ((+ 1) . Map.size $ view (config.cohorts) me)
 
-processAppendEntries :: FromJSON a => Message -> Raft s c a Message
+processAppendEntries :: FromJSON a => Message -> Raft cl s c a Message
 processAppendEntries msg = do
   me <- get
   case validateAppendEntries me msg of
@@ -220,11 +243,11 @@ processAppendEntries msg = do
                              $ me
                    in do put me'
                          debug "Succeeded!" $ return (response True me')
-  where updateCommitIndex :: Server s c a -> Maybe LogIndex -> LogIndex
+  where updateCommitIndex :: Server cl s c a -> Maybe LogIndex -> LogIndex
         updateCommitIndex me Nothing = view commitIndex me
         updateCommitIndex me (Just theirs) = min theirs (viewLastLogIndex me)
 
-        response :: Bool -> Server s c a -> Message
+        response :: Bool -> Server cl s c a -> Message
         response b me = appendEntriesResponse (view currentTerm me) b $ responseInfo msg me
 
         updateLogWith :: [IndexedEntry a] -> Log a -> Log a
@@ -248,7 +271,7 @@ processAppendEntries msg = do
           | otherwise             = debug ("processAppendEntries :: Error, there's a hole in the log! Last index: "
                                            ++ show (lastIndex lg) ++ "; Entry index: " ++ show i) lg
 
-validateAppendEntries :: FromJSON a => Server s c a -> Message -> Maybe [IndexedEntry a]
+validateAppendEntries :: FromJSON a => Server cl s c a -> Message -> Maybe [IndexedEntry a]
 validateAppendEntries serv msg =  case Just . all (== True) =<< sequence [
   debugUnlessM "Term too old. " $ (>= view currentTerm serv) <$> term msg,
   debugUnlessM "Mismatched term at prev index. " $ noPrevLogEntries `maybeOr` prevLogEntryMatches
@@ -263,7 +286,7 @@ validateAppendEntries serv msg =  case Just . all (== True) =<< sequence [
         maybeOr (Just True) _ = Just True
         maybeOr _ b2 = b2
 
-processRequestVote :: FromJSON a => Message -> Raft s c a Message
+processRequestVote :: FromJSON a => Message -> Raft cl s c a Message
 processRequestVote msg = do
   me <- get
   case validateRequestVote me msg of
@@ -273,11 +296,11 @@ processRequestVote msg = do
                            $ me
                  in do put me'
                        debug "Succeeded!" $ return (response True me')
-  where response :: Bool -> Server s c a -> Message
+  where response :: Bool -> Server cl s c a -> Message
         response b me = requestVoteResponse (view currentTerm me) b $ responseInfo msg me
 
 
-validateRequestVote :: FromJSON a => Server s c a -> Message -> Maybe ServerId
+validateRequestVote :: FromJSON a => Server cl s c a -> Message -> Maybe ServerId
 validateRequestVote serv msg = case Just . all (== True) =<< sequence [
   debugUnlessM "Already voted for another candidate." $ canVote (view votedFor serv) <$> candidateId msg,
   debugUnlessM "Term too old." $ (>= view currentTerm serv) <$> term msg,
@@ -313,16 +336,16 @@ configureCohorts conf = liftM Map.fromList $ pure conf
                    where connectAll :: [(a, IO b)] -> IO [(a, b)]
                          connectAll connections = return . zip (map fst connections) =<< mapM snd connections
 
-configureSelf :: Connection c => CohortConfig -> ClusterConfig -> s a -> IO (ServerConfig s c a)
+configureSelf :: (ClientConnection cl a, Connection c) => CohortConfig -> ClusterConfig -> s a -> IO (ServerConfig cl s c a)
 configureSelf myConf cluster stor = do
   self <- Just <$> newOwnFollower
   clust' <- configureCohorts cluster
-  return $ ServerConfig myRole myConf self clust' stor
+  ServerConfig myRole myConf self clust' stor <$> (fromClientConfig $ view clientConfig cluster)
   where myRole = if view cohortId myConf == view clusterLeader cluster
                  then Leader
                  else Follower
 
-readJSONConfig :: (Persist s, Connection c) => String -> ServerId -> IO (ServerConfig s c String)
+readJSONConfig :: (ClientConnection cl a, Persist s, Connection c) => String -> ServerId -> IO (ServerConfig cl s c a)
 readJSONConfig f myId = do
   confStr <- ByteString.readFile f
   let maybeConf = decode confStr >>= (\clust -> liftM2 (,) (Just clust) (myConf clust))
@@ -335,7 +358,7 @@ readJSONConfig f myId = do
         filterMe :: ServerId -> ClusterConfig -> ClusterConfig
         filterMe sid = over clusterServers (filter ((/= sid) . view cohortId))
 
-debugMain :: (Show c, Show a) => (Server s c a -> IO (Server s c a)) -> Server s c a -> IO (Server s c a)
+debugMain :: (Show c, Show a) => (Server cl s c a -> IO (Server cl s c a)) -> Server cl s c a -> IO (Server cl s c a)
 debugMain mainFn serv = do
   let servInfo = show (view serverId serv) ++ " " ++ show (view (config.role) serv)
   putStrLn $ "===== " ++ servInfo ++ " STARTING ====="
@@ -351,15 +374,15 @@ debugMain mainFn serv = do
   return serv'
 
 
-type ServerWorker s c a = (MVar (Server s c a)) -> IO ()
-type ServerListener s c a = Handle -> ServerWorker s c a
+type ServerWorker cl s c a = (MVar (Server cl s c a)) -> IO ()
+type ServerListener cl s c a = Handle -> ServerWorker cl s c a
 
 -- takeMVar' :: MVar a -> IO a
 -- takeMVar' mv = fromJust <$> tryTakeMVar mv
 
-withListeners :: (ClientConnection cli, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
-                 cli a -> Server s c a -> ServerListener s c a -> [ServerWorker s c a] -> IO (Server s c a)
-withListeners client serv0 acceptFn otherFns = do
+withListeners :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
+                 Server cl s c a -> ServerListener cl s c a -> [ServerWorker cl s c a] -> IO (Server cl s c a)
+withListeners serv0 acceptFn otherFns = do
   let initialRole = view (config.role) serv0
   serverState <- newEmptyMVar
   workerThreads <- newMVar []
@@ -385,7 +408,7 @@ withListeners client serv0 acceptFn otherFns = do
   serv' <- takeMVar serverState
   let newRole = view (config.role) serv'
     in if initialRole /= newRole
-       then debug ("Restaring with new role: " ++ show newRole) mainForRole client serv'
+       then debug ("Restaring with new role: " ++ show newRole) mainForRole serv'
        else return serv'
   where spawnerThread sock serverState workerThreads = do
           (sock', _) <- accept sock
@@ -395,107 +418,129 @@ withListeners client serv0 acceptFn otherFns = do
           snocQueue workerThreads =<< forkIO (acceptFn hdl serverState)
           spawnerThread sock serverState workerThreads
 
-cleanupAndExit :: (Show a) => MVar (Server s c a) -> MVar [ThreadId] -> MVar () -> IO ()
+cleanupAndExit :: (Show a) => MVar (Server cl s c a) -> MVar [ThreadId] -> MVar () -> IO ()
 cleanupAndExit serverState workersQueue done = do
-  serverLock <- debug "Cleaning up..." $ takeMVar serverState
-  mapM killThread <$> takeMVar workersQueue
+  serverLock <- takeMVar serverState
+  workers <- takeMVar workersQueue
+  unless (null workers) $
+    debug "Workers killed." . mapM_ killThread . debug "Cleaning up..." $ workers
+
   putMVar workersQueue []
   putMVar serverState serverLock
-  debug "Workers killed." $ putMVar done ()
+  putMVar done ()
 
 snocQueue :: MVar [a] -> a -> IO ()
 snocQueue q v = takeMVar q >>= putMVar q . (++ [v])
 
 
 -- Type signature commented out because it needs an explicit FORALL to compile properly and, well, fuck that
--- listenerFromHandle :: Connection conn => (conn -> MVar (Server s c a) -> IO ()) -> Handle -> MVar (Server s c a) -> IO ()
+-- listenerFromHandle :: Connection conn => (conn -> MVar (Server cl s c a) -> IO ()) -> Handle -> MVar (Server cl s c a) -> IO ()
 listenerFromHandle listener hdl servBox = forever $ listener (SimpleHandleConnection hdl) servBox
 
-listenForSomethingOnce :: (Persist s, Connection conn, FromJSON a, ToJSON a) =>
-                          (Message -> Bool) -> conn -> MVar (Server s c a) -> IO ()
-listenForSomethingOnce shouldHandle conn servBox = do
+-- Listen for a message, check for relevance, process it.
+listenForSomethingOnce :: (ClientConnection cl a, Persist s, Connection conn, FromJSON a, ToJSON a, Show a) =>
+                          (Message -> Bool) -> (Message -> Raft cl s c a (Maybe Message)) ->
+                          conn -> MVar (Server cl s c a) -> IO ()
+listenForSomethingOnce shouldHandle handler conn servBox = do
   maybeReq <- listen conn
   maybe retryLater (maybeProcess . debug' "Received request... ") maybeReq
-    where retryLater = threadDelay (kReconnect * 1000)
-          noop = return ()
+    where doMaybe :: (a -> IO ()) -> Maybe a -> IO ()
+          doMaybe = maybe $ return ()
+
+          retryLater :: IO ()
+          retryLater = threadDelay (kReconnect * 1000)
+
+          maybeProcess :: Message -> IO ()
           maybeProcess req
             | shouldHandle req = do
                 serv <- takeMVar servBox
-                let (resp, serv') = runState (handleRequest req) serv
+                let (resp, serv') = runState (handler req) serv
                 persist serv'
-                let newCommits = mapMaybe (flip entry $ view log serv) [1 + view commitIndex serv .. view commitIndex serv']
-                mapM_ (flip committed cli . view entryData) newCommits -- TODO move client into server.config
+
                 putMVar servBox serv'
-                maybe noop (`respond` conn) resp
-            | otherwise = debug ("Suppressing unexpected message of type " ++ show (view msgType req)) noop
+                doMaybe (`respond` conn) resp
+            | otherwise = debug ("Suppressing unexpected message of type " ++ show (view msgType req)) return ()
 
 -- Used by Follower coordinator thread to listen for requests (only).
-listenForRequestOnce :: (Persist s, Connection conn, FromJSON a, ToJSON a) => conn -> MVar (Server s c a) -> IO ()
-listenForRequestOnce = listenForSomethingOnce (isRequest . view msgType)
+listenForRequestOnce :: (ClientConnection cl a, Persist s, Connection conn, FromJSON a, ToJSON a, Show a) =>
+                        conn -> MVar (Server cl s c a) -> IO ()
+listenForRequestOnce = listenForSomethingOnce (isRequest . view msgType) handleRequest
 
+-- TODO use `forever` at toplevel instead of recursion here
 -- Used on the Leader only to listen for responses (only).
-listenForResponseOnce :: (Persist s, Connection conn, FromJSON a, ToJSON a) => conn -> MVar (Server s c a) -> IO ()
+listenForResponseOnce :: (ClientConnection cl a, Persist s, Connection conn, FromJSON a, ToJSON a, Show a) =>
+                         conn -> MVar (Server cl s c a) -> IO ()
 -- listenForResponseOnce = debug "Listening for response..." $ listenForSomethingOnce (isResponse . view msgType)
-listenForResponseOnce conn serv = do
-  listenForSomethingOnce (isResponse . view msgType) conn serv
-  listenForResponseOnce conn serv
-
+listenForResponseOnce conn servBox = do
+  listenForSomethingOnce (isResponse . view msgType) (\resp -> handleResponse resp >> return Nothing) conn servBox
+  listenForResponseOnce conn servBox
 
 --- Main functions for each role
 
-mainForRole :: (ClientConnection cli, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
-               cli a -> Server s c a -> IO (Server s c a)
-mainForRole cli serv0 = case view (config.role) serv0 of
-  Follower -> followerMain cli serv0
-  Leader -> leaderMain cli serv0
-  (Candidate _) -> candidateMain cli serv0
+mainForRole :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
+               Server cl s c a -> IO (Server cl s c a)
+mainForRole serv0 = case view (config.role) serv0 of
+  Follower -> followerMain serv0
+  Leader -> leaderMain serv0
+  (Candidate _) -> candidateMain serv0
 
 
-followerMain :: (ClientConnection cli, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
-                cli a -> Server s c a -> IO (Server s c a)
-followerMain cli serv0 = withListeners cli serv0 (listenerFromHandle listenForRequestOnce) []
+followerMain :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
+                Server cl s c a -> IO (Server cl s c a)
+followerMain serv0 = withListeners serv0 (listenerFromHandle listenForRequestOnce) []
 
-candidateMain ::  (ClientConnection cli, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
-                  cli a -> Server s c a -> IO (Server s c a) -- TODO: after successful request, downgrade Role
-candidateMain cli serv0 = withListeners cli serv0
-                          (listenerFromHandle listenForRequestOnce)
-                          (voteForMe : selfListener serv0 ++ cohortListeners serv0)
+candidateMain :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
+                 Server cl s c a -> IO (Server cl s c a) -- TODO: after successful request, downgrade Role
+candidateMain serv0 = withListeners serv0
+                      (listenerFromHandle listenForRequestOnce)
+                      (voteForMe : selfListener serv0 ++ cohortListeners serv0)
   where voteForMe = undefined
 
 
-leaderMain :: (ClientConnection cli, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
-              cli a -> Server s c a -> IO (Server s c a)
-leaderMain cli serv0 = withListeners cli serv0
-                       (listenerFromHandle listenForRequestOnce)
-                       (broadcastThread cli : selfListener serv0 ++ cohortListeners serv0)
+leaderMain :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
+              Server cl s c a -> IO (Server cl s c a)
+leaderMain serv0 = withListeners serv0
+                   (listenerFromHandle listenForRequestOnce)
+                   (broadcastThread : commitReporter : selfListener serv0 ++ cohortListeners serv0)
 
-selfListener :: (Persist s, ToJSON a, FromJSON a) => Server s c a -> [ServerWorker s c a]
+commitReporter :: (ClientConnection cl a, Show a) => ServerWorker cl s c a
+commitReporter servBox = do
+  serv <- takeMVar servBox
+  let latestCommitted = view entryData <$> view commitIndex serv `entry` view log serv
+  maybe (return ()) (`committed` view (config.client) serv) latestCommitted
+  putMVar servBox serv
+  threadDelay kCommitReport
+  commitReporter servBox
+
+selfListener :: (ClientConnection cl a, Persist s, FromJSON a, ToJSON a, Show a) =>
+                Server cl s c a -> [ServerWorker cl s c a]
 selfListener serv0 = case view (config.ownFollower) serv0 of
                 Nothing -> []
-                (Just self) -> [\servBox -> forever $ listenForResponseOnce (selfConnection servBox self) servBox]
+                (Just self) -> [\servBox -> listenForResponseOnce (selfConnection servBox self) servBox]
 
 
-cohortListeners :: (Persist s, Connection c, ToJSON a, FromJSON a) => Server s c a -> [ServerWorker s c a]
+cohortListeners :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
+                   Server cl s c a -> [ServerWorker cl s c a]
 cohortListeners serv = map listenForResponseOnce $ cohortConnections serv
-  where cohortConnections :: Server s c a -> [c]
+  where cohortConnections :: Server cl s c a -> [c]
         cohortConnections = map snd . Map.toList . view (config.cohorts)
 
-broadcastThread :: (ClientConnection cli, Connection c, ToJSON a, FromJSON a) => cli a -> MVar (Server s c a) -> IO ()
-broadcastThread cli servBox = do
+broadcastThread :: (ClientConnection cl a, Connection c, ToJSON a, FromJSON a, Show a) => MVar (Server cl s c a) -> IO ()
+broadcastThread servBox = do
   nextMessageId <- newIORef 0 -- TODO: need to persist nextMessageId?
   serv0 <- takeMVar servBox
   let catchUp = appendEntriesFromLeader serv0 . logWithIndices $ serv0
   serv' <- broadcast nextMessageId catchUp serv0
   putMVar servBox serv'
-  leaderLoop nextMessageId cli servBox
+  leaderLoop nextMessageId servBox
 
-leaderLoop :: (ClientConnection cli, Connection c, ToJSON a, FromJSON a) => IORef MessageId -> cli a -> MVar (Server s c a) -> IO ()
-leaderLoop nextMid cli servBox = do
-  nextLogEntry <- getLogEntry cli
-  serv <- takeMVar servBox
+leaderLoop :: (ClientConnection cl a, Connection c, ToJSON a, FromJSON a, Show a) => IORef MessageId -> MVar (Server cl s c a) -> IO ()
+leaderLoop nextMid servBox = do
+  serv0 <- takeMVar servBox
+  nextLogEntry <- getLogEntry $ view (config.client) serv0
 
-  let nextLog = logMap (++ [LogEntry (view currentTerm serv) nextLogEntry]) $ view log serv
-  let update = appendEntriesFromLeader serv [last . withIndices $ nextLog]
+  let serv = over log (logMap (++ [LogEntry (view currentTerm serv) nextLogEntry])) serv0
+  let update = appendEntriesFromLeader serv [last . logWithIndices $ serv]
   let self = fromJust $ view (config.ownFollower) serv
   selfUpdate <- update <$> requestInfo nextMid serv
 
@@ -503,33 +548,32 @@ leaderLoop nextMid cli servBox = do
   putMVar servBox serv'
   respond selfUpdate $ selfConnection servBox self
 
-  leaderLoop nextMid cli servBox
+  leaderLoop nextMid servBox
 
 
 main :: IO ()
 main = do
   args <- getArgs
-  client <- newTestSIClient
   case args of
    (myId:"test":_) -> testMain . fromIntegral . read $ myId
 
    (myId:"log":_) -> do
      let sid = fromIntegral . read $ myId
-     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig JsonStorage NilConnection String)
+     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig SimpleIncrementingClient JsonStorage NilConnection String)
      lg <- view log <$> (fromPersist . initializeFollower $ conf)
      logMain sid lg
 
    (myId:"leader":_) -> do
      let sid = fromIntegral . read $ myId
-     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig JsonStorage HandleConnection String)
+     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig SimpleIncrementingClient JsonStorage HandleConnection String)
      serv <- fromPersist . initializeFollower $ conf
-     void $ debugMain (leaderMain client) (promoteToLeader serv)
+     void $ debugMain leaderMain (promoteToLeader serv)
 
    (myId:_) -> do
      let sid = fromIntegral . read $ myId
-     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig JsonStorage NilConnection String)
+     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig SimpleIncrementingClient JsonStorage NilConnection String)
      serv <- fromPersist . initializeFollower $ conf
-     void $ debugMain (followerMain client) serv
+     void $ debugMain followerMain serv
 
    _ -> error "Invalid arguments."
 
@@ -578,12 +622,12 @@ testMain myId = do
 assertAllEqual :: (Eq a, Show a) => String -> a -> [a] -> Assertion
 assertAllEqual msg expected = mapM_ (assertEqual msg expected)
 
-data InMemoryConnection s c a = InMemoryConnection (IORef (Server s c a)) (IORef MessageId)
+data InMemoryConnection cl s c a = InMemoryConnection (IORef (Server cl s c a)) (IORef MessageId)
 
-selfConnectionStorage :: InMemoryConnection s c a -> IO (s a)
+selfConnectionStorage :: InMemoryConnection cl s c a -> IO (s a)
 selfConnectionStorage (InMemoryConnection servRef _) = view (config.storage) <$> readIORef servRef
 
-instance (ToJSON a, FromJSON a, Persist s) => Connection (InMemoryConnection s c a) where
+instance (ToJSON a, FromJSON a, Show a, Persist s) => Connection (InMemoryConnection AbortClient s c a) where
   request req (InMemoryConnection servRef _) = do
     serv <- readIORef servRef
     let (resp, serv') = runState (handleRequest req) serv
@@ -600,16 +644,17 @@ instance (ToJSON a, FromJSON a, Persist s) => Connection (InMemoryConnection s c
   fromConfig conf@(CohortConfig sid host port) = do
     mid <- newIORef 0
     fol <- newOwnFollower
-    serv <- newIORef . initializeFollower $ ServerConfig Follower conf Nothing Map.empty (fromName storageName)
+    serv <- newIORef . initializeFollower $ ServerConfig Follower conf Nothing Map.empty (fromName storageName) AbortClient
     return $ InMemoryConnection serv mid
     where storageName = kLogDir ++ host ++ "_" ++ show port ++ ".local.json"
 
-instance Show a => Show (InMemoryConnection s c a) where
+instance Show a => Show (InMemoryConnection cl s c a) where
          show (InMemoryConnection servRef _) = show . unsafePerformIO . readIORef $ servRef
 
 simpleConfig :: ClusterConfig
 simpleConfig = ClusterConfig {
     _clusterLeader = 1,
+    _clientConfig = ClientConfig "localhost" 3000,
     _clusterServers = [
       CohortConfig 1 "localhost" 3001,
       CohortConfig 2 "localhost" 3002,
@@ -617,12 +662,12 @@ simpleConfig = ClusterConfig {
       ]
     }
 
-testLocalSystemWith :: Log String -> ServerId -> IO (Server JsonStorage (InMemoryConnection JsonStorage NilConnection String) String)
+testLocalSystemWith :: Log String -> ServerId -> IO (Server AbortClient JsonStorage (InMemoryConnection AbortClient JsonStorage NilConnection String) String)
 testLocalSystemWith lg myId = do
   conf <- readJSONConfig (kConfigFile myId) myId
   let serv = initializeFollower conf
   case view role conf of
-   Leader -> leaderMain AbortClient . injectPersistentState (1, Just myId, lg) . promoteToLeader $ serv
+   Leader -> leaderMain . injectPersistentState (1, Just myId, lg) . promoteToLeader $ serv
 
 
 writeTestConfig :: ClusterConfig -> IO ()
@@ -630,32 +675,3 @@ writeTestConfig = ByteString.writeFile (kConfigDir ++ "config.auto.json") . enco
 
 readTestConfig :: IO (Maybe ClusterConfig)
 readTestConfig = decode <$> ByteString.readFile (kConfigDir ++ "config.auto.json")
-
-testManual :: IO ()
-testManual = do
-  nextMessageId <- newIORef 1
-  print "Test: sending messages."
-  me <- promoteToLeader . initializeFollower . fakeConf . Just <$> newOwnFollower
-  broadcast nextMessageId append me
-  readIORef nextMessageId >>= print . (++) "Next message id: " . show
-  print "Done."
-
-  print "Test: receiving messages."
-  let me' = demoteToFollower me :: Server JsonStorage FakeConnection String
-  req <- fmap fromJust . listen $ FakeConnection
-  let (resp, me'') = runState (processAppendEntries req) me'
-  print resp
-  print (view log me'')
-  print "Done."
-    where fakeConf fol = ServerConfig Booting myConf fol followers (JsonStorage $ kLogDir ++ "test.json")
-          myConf = CohortConfig 1 "localhost" 1001
-          followers = Map.fromList [
-            (1, FakeConnection),
-            (2, FakePartition),
-            (3, FakeConnection),
-            (4, FakePartition),
-            (5, FakeConnection)
-            ]
-          append :: BaseMessage
-          append = appendEntries 11 0 1 2 (zip [1..] myLog) 3
-          myLog = [] :: [LogEntry String]

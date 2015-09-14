@@ -147,25 +147,28 @@ instance Connection HandleConnection where
 
 
 
-
-
-
-class ClientConnection c where
+class ClientConnection c a where
   getLogEntry :: c a -> IO a
   committed :: Show a => a -> c a -> IO ()
+
+  fromClientConfig :: ClientConfig -> IO (c a)
 
 data SimpleIncrementingClient a = SIClient (Int -> a) (IORef Int)
 
 newTestSIClient :: IO (SimpleIncrementingClient String)
 newTestSIClient = SIClient (\i -> "Log Entry: spacedate " ++ show i) <$> newIORef 1
 
-instance ClientConnection SimpleIncrementingClient where
+instance ClientConnection SimpleIncrementingClient String where
   getLogEntry (SIClient convert ctr) = threadDelay 1500000 >> convert <$> atomicModifyIORef ctr (\i -> (i + 1, i))
-  committed x _ = putStrLn $ "!! COMMITTED `" ++ show x ++ "`"
+  committed x _ = putStrLn ("!! COMMITTED `" ++ show x ++ "`")
+
+  fromClientConfig _ = newTestSIClient
 
 
 data AbortClient a = AbortClient
 
-instance ClientConnection AbortClient where
+instance ClientConnection AbortClient a where
   getLogEntry _ = raiseSignal keyboardSignal >> threadDelay 999999 >> error "unused"
-  committed x _ = putStrLn $ "!! COMMITTED `" ++ show x ++ "`"
+  committed _ _ = debug "ERROR! AbortClient should not receive commits." return ()
+
+  fromClientConfig _ = return AbortClient

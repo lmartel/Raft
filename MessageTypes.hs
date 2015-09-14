@@ -58,10 +58,10 @@ lastLogTerm = extract kLastLogTerm
 voteGranted :: Message -> Maybe Bool
 voteGranted = extract kVoteGranted
 
-heartbeatFromLeader :: ToJSON a => Server s c a -> BaseMessage
+heartbeatFromLeader :: ToJSON a => Server cl s c a -> BaseMessage
 heartbeatFromLeader = flip appendEntriesFromLeader []
 
-appendEntriesFromLeader :: ToJSON a => Server s c a -> [(LogIndex, LogEntry a)] -> BaseMessage
+appendEntriesFromLeader :: ToJSON a => Server cl s c a -> [(LogIndex, LogEntry a)] -> BaseMessage
 appendEntriesFromLeader s es = appendEntries (view currentTerm s) (view serverId s) findPrevLogIndex findPrevLogTerm es (view commitIndex s)
   where findPrevLogTerm :: Term
         findPrevLogTerm = case termAtIndex findPrevLogIndex s of

@@ -134,6 +134,11 @@ instance ToJSON Message
 instance FromJSON Message
 
 --- Config types
+data ClientConfig = ClientConfig {
+  _clientHostname :: Hostname,
+  _clientPort :: Port
+  } deriving (Eq, Show, Generic)
+makeLenses ''ClientConfig
 data CohortConfig = CohortConfig {
   _cohortId :: ServerId,
   _cohortHostname :: Hostname,
@@ -142,6 +147,7 @@ data CohortConfig = CohortConfig {
 makeLenses ''CohortConfig
 data ClusterConfig = ClusterConfig {
   _clusterLeader :: ServerId,
+  _clientConfig :: ClientConfig,
   _clusterServers :: [CohortConfig]
   } deriving (Eq, Show, Generic)
 makeLenses ''ClusterConfig
@@ -178,21 +184,22 @@ selfConnection self (OwnFollower q qFlag) = SelfConnection self q qFlag
 
 --- Server type
 
-data ServerConfig s c e = ServerConfig {
+data ServerConfig cl s c a = ServerConfig {
   _role :: Role,
   _ownCohort :: CohortConfig,
   _ownFollower :: Maybe OwnFollower,
   _cohorts :: ServerMap c,
-  _storage :: s e
+  _storage :: s a,
+  _client :: cl a
   }
 makeLenses ''ServerConfig
 
-data Server s c e = Server {
+data Server cl s c a = Server {
   --- Raft State
   -- Follower state
   _currentTerm :: Term,
   _votedFor :: Maybe ServerId,
-  _log :: Log e,
+  _log :: Log a,
   _commitIndex :: LogIndex,
   _lastApplied :: LogIndex,
   -- Leader-only state
@@ -200,17 +207,17 @@ data Server s c e = Server {
   _matchIndex :: Maybe (ServerMap LogIndex),
 
   --- Non-raft state
-  _config :: ServerConfig s c e,
+  _config :: ServerConfig cl s c a,
   _outstanding :: Map MessageId Message
   }
 makeLenses ''Server
-serverId :: Lens' (Server s c e) ServerId
+serverId :: Lens' (Server cl s c a) ServerId
 serverId = config.ownCohort.cohortId
 
-instance Show (ServerConfig s c e) where
+instance Show (ServerConfig cl s c a) where
   show conf = "ServerConfig (" ++ show (view role conf) ++ ") (" ++ show (view ownCohort conf) ++ ")"
 
-instance (Show e) => Show (Server s c e) where
+instance (Show a) => Show (Server cl s c a) where
   show s = "=== Server " ++ show (view serverId s) ++ " state ===" ++ "\n"
            ++ "currentTerm: " ++ show (view currentTerm s) ++ "\n"
            ++ "votedFor: " ++ show (view votedFor s) ++ "\n"
@@ -224,7 +231,7 @@ instance (Show e) => Show (Server s c e) where
           showM (Just x) = show x
 
 
-type Raft s c a v = State (Server s c a) v
+type Raft cl s c a v = State (Server cl s c a) v
 
 --- Accessors and helpers
 
@@ -232,19 +239,19 @@ type Raft s c a v = State (Server s c a) v
 lastIndex :: Log a -> LogIndex
 lastIndex = LogIndex . fromIntegral . length . view logEntries
 
-viewLastLogIndex :: Server s c a -> LogIndex
+viewLastLogIndex :: Server cl s c a -> LogIndex
 viewLastLogIndex = lastIndex . view log
 
 withIndices :: Log a -> [(LogIndex, LogEntry a)]
 withIndices = zip [1..] . view logEntries
 
-logWithIndices :: Server s c a -> [(LogIndex, LogEntry a)]
+logWithIndices :: Server cl s c a -> [(LogIndex, LogEntry a)]
 logWithIndices = withIndices . view log
 
-serverCohorts :: Server s c a -> [c]
+serverCohorts :: Server cl s c a -> [c]
 serverCohorts = map snd . Map.toList . view (config.cohorts)
 
-termAtIndex :: LogIndex -> Server s c a -> Maybe Term
+termAtIndex :: LogIndex -> Server cl s c a -> Maybe Term
 termAtIndex 0 _ = Just 0
 termAtIndex i s = entry i (view log s) >>= Just . view entryTerm
 
@@ -253,14 +260,14 @@ termAtIndex i s = entry i (view log s) >>= Just . view entryTerm
 defaultPersistentState :: PersistentState e
 defaultPersistentState = (0, Nothing, Log [])
 
-injectPersistentState :: PersistentState e -> Server s c e  -> Server s c e
+injectPersistentState :: PersistentState a -> Server cl s c a  -> Server cl s c a
 injectPersistentState (t, v, l) serv = set currentTerm t . set votedFor v . set log l $ serv
 
-extractPersistentState :: Server s c e -> PersistentState e
+extractPersistentState :: Server cl s c a -> PersistentState a
 extractPersistentState serv = (view currentTerm serv, view votedFor serv, view log serv)
 
-persist :: (Persist s, ToJSON e) => Server s c e -> IO ()
+persist :: (Persist s, ToJSON a) => Server cl s c a -> IO ()
 persist serv = writeToStable (extractPersistentState serv) $ view (config.storage) serv
 
-fromPersist :: (Persist s, FromJSON e) => Server s c e -> IO (Server s c e)
+fromPersist :: (Persist s, FromJSON a) => Server cl s c a -> IO (Server cl s c a)
 fromPersist serv = readFromStable (view (config.storage) serv) >>= return . flip injectPersistentState serv

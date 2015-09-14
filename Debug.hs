@@ -4,14 +4,12 @@ import System.IO.Unsafe
 
 {-# NOINLINE debug #-}
 debug :: String -> a -> a
-debug err dat = unsafePerformIO (putStrLn err) `seq` dat
--- debug _ = id
+debug err = debug' (err ++ "\n")
 
 {-# NOINLINE debug' #-}
 debug' :: String -> a -> a
-debug' err dat = unsafePerformIO (putStr err >> hFlush stdout) `seq` dat
--- debug' _ = id
-
+debug' _ = id -- Disable debug log globally
+debug' err  = (unsafePerformIO (putStr err >> hFlush stdout) `seq`)
 
 -- Debug helpers
 
