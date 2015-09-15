@@ -122,9 +122,11 @@ instance (ToJSON a, FromJSON a, Show a) => Connection (SelfConnection (Server cl
   respond msg (SelfConnection servBox respQ qNotEmpty) = do
     serv <- takeMVar servBox
     let (mResp, serv') = runState (handleRequest msg) serv
+    -- persist serv' -- TODO figure out whether to persist here or on leader after receiving client update
+    -- TODO is the problem lazy evaluation of mResp? try using strict list for queue
 
     putMVar servBox serv'
-    maybe (return ()) (\resp -> snocQueue respQ resp >> tryPutMVar qNotEmpty () >> return ()) mResp
+    maybe (return ()) (\resp -> resp `seq` snocQueue respQ resp >> tryPutMVar qNotEmpty () >> return ()) mResp
 
   listen (SelfConnection _ respQ qNotEmpty) = do
     (nxt:rest) <- takeMVar qNotEmpty >> takeMVar respQ
@@ -521,7 +523,7 @@ candidateMain serv0 = newIORef 0 >>= \(nextMessageId) -> -- TODO: need to persis
         amElected me = case view (config.role) me of
           (Candidate votes) -> 2 * (Map.size . Map.filter (== True) $ votes)
                                > ((+ 1) . Map.size $ view (config.cohorts) me)
---          _ -> error "candidateMain running, but server is not in candidate role."
+--          _ -> error "candidateMain running, but server is not in candidate role." -- TODO
           _ -> debug "candidateMain running, but server is not in candidate role." True
 
 leaderMain :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
@@ -529,9 +531,9 @@ leaderMain :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSO
 leaderMain serv0 = newIORef 0 >>= \midGen ->
   withListeners serv0 -- TODO: need to persist nextMessageId?
   (listenerFromHandle listenForRequestOnce)
---  (broadcastThread midGen : heartbeatThread midGen : commitReporter : selfListener serv0 ++ cohortListeners serv0)
+  (broadcastThread midGen : heartbeatThread midGen : commitReporter : selfListener serv0 ++ cohortListeners serv0)
 --  (\_ _ -> return ())
-  (broadcastThread midGen : cohortListeners serv0)
+--  (broadcastThread midGen : cohortListeners serv0)
 
 -- This thread is responsible for resending unsuccessful AppendEntries requests,
 -- and sending heartbeats (empty requests) to caught-up followers to reset their election timeout
