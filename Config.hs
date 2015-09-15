@@ -5,18 +5,27 @@ import Control.Monad
 
 import RaftTypes
 
-kReconnect :: Int
--- kReconnect = 200
-kReconnect = 1500
+type Microsec = Int
 
-kCommitReport :: Int
-kCommitReport = 1500
+kReconnect :: Microsec
+-- kReconnect = 200000
+kReconnect = 1500000
 
-kTimeoutMin :: Int
-kTimeoutMin = 300
+kGenerateClientUpdates :: Microsec
+kGenerateClientUpdates = 700000
+-- kGenerateClientUpdates = 4000000
 
-kTimeoutMax :: Int
-kTimeoutMax = 500
+kCommitReport :: Microsec
+kCommitReport = 1500000
+
+kHeartbeat :: Microsec
+kHeartbeat = 300000
+
+kTimeoutMin :: Microsec
+kTimeoutMin = 300000
+
+kTimeoutMax :: Microsec
+kTimeoutMax = 500000
 
 instance ToJSON CohortConfig where
   toJSON (CohortConfig sid host port) = object [

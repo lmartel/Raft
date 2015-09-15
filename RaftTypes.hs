@@ -242,6 +242,13 @@ lastIndex = LogIndex . fromIntegral . length . view logEntries
 viewLastLogIndex :: Server cl s c a -> LogIndex
 viewLastLogIndex = lastIndex . view log
 
+lastTerm :: Log a -> Term
+lastTerm (Log []) = 0
+lastTerm (Log es) = view entryTerm (last es)
+
+viewLastLogTerm :: Server cl s c a -> Term
+viewLastLogTerm = lastTerm . view log
+
 withIndices :: Log a -> [(LogIndex, LogEntry a)]
 withIndices = zip [1..] . view logEntries
 

@@ -91,18 +91,25 @@ instance Show HandleConnection where
 debugConnectError :: Bool -> CohortConfig -> IOError -> IO ()
 debugConnectError verbose conf ex
   -- Connection refused.
-  | isDoesNotExistError ex = when verbose $ debug ("Cannot connect to " ++ followerInfo) return ()
-
-  | ioeGetErrorType ex == ResourceVanished = debug (followerInfo ++ "disconnected.") return ()
+  | isDoesNotExistError ex                 = when verbose $ putStrLn ("Cannot connect to " ++ followerInfo)
+  | isEOFError ex                          = when verbose $ putStrLn (followerInfo ++ " finished.")
+  | ioeGetErrorType ex == ResourceVanished = when verbose $ putStrLn (followerInfo ++ " disconnected.")
   | otherwise                              = error ("Unknown connection error: " ++ show ex)
   where followerInfo = "Follower " ++ show (view cohortId conf)
-                       ++ " (" ++ show (view cohortHostname conf)
+                       ++ " (" ++ view cohortHostname conf
                        ++ ":" ++ show (view cohortPort conf)
                        ++ ")"
 
 connectHandle :: Bool -> CohortConfig -> IO (Maybe Handle)
-connectHandle verbose conf@(CohortConfig _ host portNum) = catch (fmap Just . connectTo host . PortNumber . fromIntegral $ portNum)
-                                                           (\ex -> debugConnectError verbose conf ex >> return Nothing)
+connectHandle verbose conf@(CohortConfig _ host portNum) =
+  catch (do
+    hdl <- connectHandle'
+    tid <- myThreadId
+    when verbose $ putStrLn ("Connected to follower at " ++ host ++ ":" ++ show portNum ++ "." ++ "[" ++ show tid ++ "]")
+    return (Just hdl)
+  ) (\ex -> debugConnectError verbose conf ex >> return Nothing)
+  where connectHandle' :: IO Handle
+        connectHandle' = connectTo host . PortNumber . fromIntegral $ portNum
 
 connectMaybe :: Bool -> HandleConnection -> IO ()
 connectMaybe verbose (HandleConnection conf handleRef) = do
@@ -126,24 +133,20 @@ respondMaybe' msg (Just hdl') = hPrint hdl' (encode msg)
 listenMaybe :: HandleConnection -> IO (Maybe Message)
 listenMaybe conn@(HandleConnection conf hdlRef) = do
   mHdl <- readIORef hdlRef
-  listenMaybe' mHdl
+  listenMaybe' mHdl `catch` (\ex -> debugConnectError True conf ex >> writeIORef hdlRef Nothing >> return Nothing)
 
 listenMaybe' :: Maybe Handle -> IO (Maybe Message)
 listenMaybe' Nothing = return Nothing
 listenMaybe' (Just hdl) = decode . read <$> hGetLine hdl
 
 instance Connection HandleConnection where
-  fromConfig conf@(CohortConfig _ host portNum) = do
-    putStrLn ("Connecting to follower at " ++ host ++ ":" ++ show portNum)
-    HandleConnection conf <$> (connectHandle True conf >>= newIORef)
+  fromConfig conf = HandleConnection conf <$> newIORef Nothing
 
   respond msg conn = connectMaybe False conn >> respondMaybe msg conn
   listen conn = connectMaybe True conn >> listenMaybe conn
 
   -- override `request` : should only try to connect once. If request fails, shouldn't listen for response.
   request msg conn = connectMaybe True conn >> respondMaybe msg conn >> listenMaybe conn
-
-
 
 
 
@@ -159,7 +162,7 @@ newTestSIClient :: IO (SimpleIncrementingClient String)
 newTestSIClient = SIClient (\i -> "Log Entry: spacedate " ++ show i) <$> newIORef 1
 
 instance ClientConnection SimpleIncrementingClient String where
-  getLogEntry (SIClient convert ctr) = threadDelay 1500000 >> convert <$> atomicModifyIORef ctr (\i -> (i + 1, i))
+  getLogEntry (SIClient convert ctr) = threadDelay kGenerateClientUpdates >> convert <$> atomicModifyIORef ctr (\i -> (i + 1, i))
   committed x _ = putStrLn ("!! COMMITTED `" ++ show x ++ "`")
 
   fromClientConfig _ = newTestSIClient

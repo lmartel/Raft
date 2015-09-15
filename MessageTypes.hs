@@ -8,6 +8,7 @@ import GHC.Generics
 import Control.Lens
 import Data.Aeson
 import Control.Monad
+import Data.Maybe
 import Data.List
 import Data.ByteString.Lazy.Internal (ByteString)
 
@@ -91,6 +92,9 @@ appendEntriesResponse t s = Message AppendEntriesResponse [
   (kTerm, encodeArg t),
   (kSuccess, encodeArg s)
   ]
+
+requestVoteFromCandidate :: Server cl s c a -> BaseMessage
+requestVoteFromCandidate s = requestVote (view currentTerm s) (view serverId s) (viewLastLogIndex s) (viewLastLogTerm s)
 
 requestVote :: Term -> ServerId -> LogIndex -> Term -> BaseMessage
 requestVote t cid lli llt = Message RequestVote [

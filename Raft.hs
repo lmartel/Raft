@@ -40,6 +40,7 @@ import Debug
 putMVar :: MVar a -> a -> IO ()
 putMVar box !v = LazyConcurrency.putMVar box v
 
+
 --- Initialization
 
 initializeFollower :: ServerConfig cl s c a -> Server cl s c a
@@ -56,18 +57,28 @@ initializeFollower conf = Server {
   _outstanding = Map.empty
   }
 
-promoteToLeader :: Server cl s c a -> Server cl s c a
-promoteToLeader base = set (config.role) Leader . set nextIndex (Just nis) . set matchIndex (Just mis) $ base
-  where nis :: ServerMap LogIndex
-        nis = Map.map (\_ -> viewLastLogIndex base) . view (config.cohorts) $ base
-        mis :: ServerMap LogIndex
-        mis = Map.map (\_ -> LogIndex 0) . view (config.cohorts) $ base
-
-nominateToCandidate :: Server cl s c a -> Server cl s c a
-nominateToCandidate = set (config.role) (Candidate Map.empty) . demoteToFollower
 
 demoteToFollower :: Server cl s c a -> Server cl s c a
-demoteToFollower = set (config.role) Follower . set nextIndex Nothing . set matchIndex Nothing
+demoteToFollower = set (config.role) Follower
+                   . set nextIndex Nothing
+                   . set matchIndex Nothing
+                   . set outstanding Map.empty
+
+promoteToLeader :: Server cl s c a -> Server cl s c a
+promoteToLeader old = set (config.role) Leader
+                      . set nextIndex (Just nis)
+                      . set matchIndex (Just mis)
+                      $ serv
+  where serv = demoteToFollower old
+        nis :: ServerMap LogIndex
+        nis = Map.map (\_ -> viewLastLogIndex serv) . view (config.cohorts) $ serv
+        mis :: ServerMap LogIndex
+        mis = Map.map (\_ -> LogIndex 0) . view (config.cohorts) $ serv
+
+nominateToCandidate :: Server cl s c a -> Server cl s c a
+nominateToCandidate = over currentTerm (+ 1)
+                      . set (config.role) (Candidate Map.empty)
+                      . demoteToFollower
 
 --- Sending/receiving messages
 
@@ -85,7 +96,8 @@ responseInfo req serv = MessageInfo (view serverId serv) (view (info.msgId) req)
 
 broadcast :: Connection c => IORef MessageId -> BaseMessage -> Server cl s c a -> IO (Server cl s c a)
 broadcast midRef msg serv
-  | view (config.role) serv /= Leader = return serv
+  | view (config.role) serv == Follower
+              = debug "Follower attempting to broadcast; suppressing." return serv
   | otherwise = do
       msgs <- requests <$> atomicGetNextMessageIds (length . serverCohorts $ serv) midRef
       let serv' = execState (expectResponsesTo . map snd $ msgs) serv
@@ -110,6 +122,7 @@ instance (ToJSON a, FromJSON a, Show a) => Connection (SelfConnection (Server cl
   respond msg (SelfConnection servBox respQ qNotEmpty) = do
     serv <- takeMVar servBox
     let (mResp, serv') = runState (handleRequest msg) serv
+
     putMVar servBox serv'
     maybe (return ()) (\resp -> snocQueue respQ resp >> tryPutMVar qNotEmpty () >> return ()) mResp
 
@@ -121,13 +134,12 @@ instance (ToJSON a, FromJSON a, Show a) => Connection (SelfConnection (Server cl
 
     putMVar respQ rest >> return (Just nxt)
 
-
 --- Raft algorithm core
 
 handleRequest :: (FromJSON a) => Message -> Raft cl s c a (Maybe Message)
 handleRequest msg = case view msgType msg of
   AppendEntries -> debug' "AppendEntries. " (Just <$> processAppendEntries msg)
-  RequestVote -> debug' "RequestVote." (Just <$> processRequestVote msg)
+  RequestVote -> debug' "RequestVote. " (Just <$> processRequestVote msg)
 
 handleResponse :: (ClientConnection cl a, FromJSON a, Show a) => Message -> Raft cl s c a ()
 handleResponse msg = do
@@ -147,9 +159,9 @@ handleResponse msg = do
 
         handleResponse' :: (ClientConnection cl a, FromJSON a, Show a) => Maybe (Raft cl s c a ())
         handleResponse' = case view msgType msg of
-                           AppendEntriesResponse -> debug' "AppendEntriesResponse." $
+                           AppendEntriesResponse -> debug' "AppendEntriesResponse. " $
                                                     liftM (handleAppendEntriesResponse msg) (success msg)
-                           RequestVoteResponse -> debug' "RequestVoteResponse." $
+                           RequestVoteResponse -> debug' "RequestVoteResponse. " $
                                                   liftM (handleRequestVoteResponse msg) $ voteGranted msg
 
 -- On failure: decrement nextIndex, retry later
@@ -158,7 +170,6 @@ handleAppendEntriesResponse :: (ClientConnection cl a, Show a) => Message -> Boo
 handleAppendEntriesResponse msg False = do
   me <- get
   put $ over nextIndex (fmap $ Map.insertWith (\_ old -> max (old - 1) 0) (view (info.msgFrom) msg) (1 + view commitIndex me)) me
-
 
 handleAppendEntriesResponse msg True = do
   me <- get
@@ -200,15 +211,13 @@ checkCommitted (Just xs) serv0 = let toCommit = filter (canCommit serv0) xs in
                            && termAtIndex n serv == Just (view currentTerm serv)
 
         doCommits :: (ClientConnection cl a, Show a) => Server cl s c a -> [LogIndex] -> IO ()
-        doCommits serv ns = mapM_ (commitTo serv) (debugPrint $ getEntriesForIndices serv ns)
+        doCommits serv ns = mapM_ (commitTo serv) (getEntriesForIndices serv ns)
 
         getEntriesForIndices :: Show a => Server cl s c a -> [LogIndex] -> [LogEntry a]
         getEntriesForIndices serv = mapMaybe (flip entry $ view log serv)
 
         commitTo :: (ClientConnection cl a, Show a) => Server cl s c a -> LogEntry a -> IO ()
         commitTo serv entr = view entryData entr `committed` view (config.client) serv
-
-
 
 majorityMatched :: LogIndex -> Server cl s c a -> Bool
 majorityMatched n serv = case view matchIndex serv of
@@ -223,35 +232,36 @@ handleRequestVoteResponse resp vote = do
    (Candidate votes) -> let votes' = Map.insert (view (msgInfo.msgFrom) resp) vote votes
                             me' = set (config.role) (Candidate votes') me
                         in put me'
-                           --   if wasElected votes' me'
-                             --   then return () -- TODO
-                               -- else return ()
    _ -> return ()
-  where wasElected :: ServerMap Bool -> Server cl s c a -> Bool
-        wasElected votes me = 2 * (Map.size . Map.filter (== True) $ votes)
-                              > ((+ 1) . Map.size $ view (config.cohorts) me)
 
 processAppendEntries :: FromJSON a => Message -> Raft cl s c a Message
 processAppendEntries msg = do
   me <- get
   case validateAppendEntries me msg of
    Nothing -> do put me
-                 debug "Failed validation." $ return (response False me)
+                 let resp = debugResponse False me
+                 return resp
    (Just entrs) -> let me' = set currentTerm (fromJust $ term msg)
                              . over log (updateLogWith entrs)
                              . set commitIndex (updateCommitIndex me $ leaderCommit msg)
                              $ me
                    in do put me'
-                         debug "Succeeded!" $ return (response True me')
+                         let resp = debugResponse True me'
+                         return resp
   where updateCommitIndex :: Server cl s c a -> Maybe LogIndex -> LogIndex
         updateCommitIndex me Nothing = view commitIndex me
         updateCommitIndex me (Just theirs) = min theirs (viewLastLogIndex me)
+
+        debugResponse :: Bool -> Server cl s c a -> Message
+        debugResponse False = debug "Failed validation." $ response False
+        debugResponse True = debug "Success!" $ response True
 
         response :: Bool -> Server cl s c a -> Message
         response b me = appendEntriesResponse (view currentTerm me) b $ responseInfo msg me
 
         updateLogWith :: [IndexedEntry a] -> Log a -> Log a
-        updateLogWith es = appendNew es . deleteConflicted es
+        updateLogWith [] = debug' "(Heartbeat.) " id
+        updateLogWith es = debug' ("(" ++ show (length es) ++ ".) ") appendNew es . deleteConflicted es
 
         deleteConflicted :: [IndexedEntry a] -> Log a -> Log a
         deleteConflicted es lg = case map fst . filter (isConflict lg) $ es of
@@ -308,16 +318,14 @@ validateRequestVote serv msg = case Just . all (== True) =<< sequence [
   ] of
                                 (Just True) -> candidateId msg
                                 _ -> Nothing
-  where canVote Nothing _ = False
+  where canVote Nothing _ = True
         canVote (Just vid) cid = vid == cid
-
-        localTerm = view currentTerm serv
 
         candidateLogFresh :: LogIndex -> Term -> Bool
         candidateLogFresh cLogIndex cLogTerm
-          | cLogTerm > localTerm  = True
-          | cLogTerm == localTerm = cLogIndex >= viewLastLogIndex serv
-          | otherwise             = False
+          | cLogTerm > viewLastLogTerm serv  = True
+          | cLogTerm == viewLastLogTerm serv = cLogIndex >= viewLastLogIndex serv
+          | otherwise                        = False
 --- Startup and main
 
 kConfigDir :: String
@@ -359,19 +367,19 @@ readJSONConfig f myId = do
         filterMe sid = over clusterServers (filter ((/= sid) . view cohortId))
 
 debugMain :: (Show c, Show a) => (Server cl s c a -> IO (Server cl s c a)) -> Server cl s c a -> IO (Server cl s c a)
-debugMain mainFn serv = do
-  let servInfo = show (view serverId serv) ++ " " ++ show (view (config.role) serv)
-  putStrLn $ "===== " ++ servInfo ++ " STARTING ====="
-  print $ view config serv
-  print serv
+debugMain mainFn serv0 = do
+  putStrLn $ "===== " ++ servInfo serv0 ++ " STARTING ====="
+  print $ view config serv0
+  print serv0
 
-  serv' <- mainFn serv
+  serv' <- mainFn serv0
 
-  putStrLn $ "===== " ++ servInfo ++ " FINISHING ====="
+  putStrLn $ "===== " ++ servInfo serv' ++ " FINISHING ====="
   print serv'
   putStrLn "===== ALL DONE ====="
 
   return serv'
+  where servInfo serv = show (view serverId serv) ++ " " ++ show (view (config.role) serv)
 
 
 type ServerWorker cl s c a = (MVar (Server cl s c a)) -> IO ()
@@ -448,7 +456,7 @@ listenForSomethingOnce shouldHandle handler conn servBox = do
           doMaybe = maybe $ return ()
 
           retryLater :: IO ()
-          retryLater = threadDelay (kReconnect * 1000)
+          retryLater = threadDelay kReconnect
 
           maybeProcess :: Message -> IO ()
           maybeProcess req
@@ -491,17 +499,62 @@ followerMain serv0 = withListeners serv0 (listenerFromHandle listenForRequestOnc
 
 candidateMain :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
                  Server cl s c a -> IO (Server cl s c a) -- TODO: after successful request, downgrade Role
-candidateMain serv0 = withListeners serv0
+candidateMain serv0 = newIORef 0 >>= \(nextMessageId) -> -- TODO: need to persist nextMessageId?
+                      withListeners serv0
                       (listenerFromHandle listenForRequestOnce)
-                      (voteForMe : selfListener serv0 ++ cohortListeners serv0)
-  where voteForMe = undefined
+                      (voteForMe nextMessageId : selfListener serv0 ++ cohortListeners serv0)
+  where voteForMe nextMessageId servBox = do
+          serv <- takeMVar servBox
+          if amElected serv
+            then putMVar servBox (promoteToLeader serv) >> raiseSignal sigINT
+            else do
+              let voteMsg = requestVoteFromCandidate serv
+              let self = fromJust $ view (config.ownFollower) serv
+              selfVote <- voteMsg <$> requestInfo nextMessageId serv
 
+              putMVar servBox =<< execState (expectResponsesTo [selfVote]) <$> broadcast nextMessageId voteMsg serv
+              respond selfVote $ selfConnection servBox self
+              threadDelay kHeartbeat
+              voteForMe nextMessageId servBox
+
+        amElected :: Server cl s c a -> Bool
+        amElected me = case view (config.role) me of
+          (Candidate votes) -> 2 * (Map.size . Map.filter (== True) $ votes)
+                               > ((+ 1) . Map.size $ view (config.cohorts) me)
+--          _ -> error "candidateMain running, but server is not in candidate role."
+          _ -> debug "candidateMain running, but server is not in candidate role." True
 
 leaderMain :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
               Server cl s c a -> IO (Server cl s c a)
-leaderMain serv0 = withListeners serv0
-                   (listenerFromHandle listenForRequestOnce)
-                   (broadcastThread : commitReporter : selfListener serv0 ++ cohortListeners serv0)
+leaderMain serv0 = newIORef 0 >>= \midGen ->
+  withListeners serv0 -- TODO: need to persist nextMessageId?
+  (listenerFromHandle listenForRequestOnce)
+--  (broadcastThread midGen : heartbeatThread midGen : commitReporter : selfListener serv0 ++ cohortListeners serv0)
+--  (\_ _ -> return ())
+  (broadcastThread midGen : cohortListeners serv0)
+
+-- This thread is responsible for resending unsuccessful AppendEntries requests,
+-- and sending heartbeats (empty requests) to caught-up followers to reset their election timeout
+heartbeatThread :: (Connection c, ToJSON a) => IORef MessageId -> ServerWorker cl s c a
+heartbeatThread midGen servBox = do
+  threadDelay kHeartbeat
+  serv0 <- takeMVar servBox
+  heartbeats <- mapM (finalizeHeartbeat serv0)
+                . mapMaybe (customizeHeartbeat serv0)
+                . Map.toList . fromJust $ view nextIndex serv0
+  let serv' = execState (expectResponsesTo $ map snd heartbeats) serv0
+  putMVar servBox serv'
+  mapM_ (uncurry $ flip respond) heartbeats
+  heartbeatThread midGen servBox
+  where entriesToRetry :: Server cl s c a -> LogIndex -> [IndexedEntry a]  -- TODO this +1 feels kinda hacky
+        entriesToRetry serv nxtI = mapMaybe (\i -> (,) <$> Just i <*> entry i (view log serv)) [nxtI .. viewLastLogIndex serv]
+        customizeHeartbeat :: ToJSON a => Server cl s c a -> (ServerId, LogIndex) -> Maybe (c, BaseMessage)
+        customizeHeartbeat serv (fid,nxtI) = (,)
+                                           <$> Map.lookup fid (view (config.cohorts) serv)
+                                           <*> Just (appendEntriesFromLeader serv $ entriesToRetry serv nxtI)
+        finalizeHeartbeat :: Server cl s c a -> (c, BaseMessage) -> IO (c, Message)
+        finalizeHeartbeat serv (c, base) = (,) <$> return c <*> (base <$> requestInfo midGen serv)
+
 
 commitReporter :: (ClientConnection cl a, Show a) => ServerWorker cl s c a
 commitReporter servBox = do
@@ -525,9 +578,9 @@ cohortListeners serv = map listenForResponseOnce $ cohortConnections serv
   where cohortConnections :: Server cl s c a -> [c]
         cohortConnections = map snd . Map.toList . view (config.cohorts)
 
-broadcastThread :: (ClientConnection cl a, Connection c, ToJSON a, FromJSON a, Show a) => MVar (Server cl s c a) -> IO ()
-broadcastThread servBox = do
-  nextMessageId <- newIORef 0 -- TODO: need to persist nextMessageId?
+broadcastThread :: (ClientConnection cl a, Connection c, ToJSON a, FromJSON a, Show a) =>
+                   IORef MessageId -> MVar (Server cl s c a) -> IO ()
+broadcastThread nextMessageId servBox = do
   serv0 <- takeMVar servBox
   let catchUp = appendEntriesFromLeader serv0 . logWithIndices $ serv0
   serv' <- broadcast nextMessageId catchUp serv0
@@ -536,8 +589,8 @@ broadcastThread servBox = do
 
 leaderLoop :: (ClientConnection cl a, Connection c, ToJSON a, FromJSON a, Show a) => IORef MessageId -> MVar (Server cl s c a) -> IO ()
 leaderLoop nextMid servBox = do
+  nextLogEntry <- getLogEntry =<< view (config.client) <$> readMVar servBox
   serv0 <- takeMVar servBox
-  nextLogEntry <- getLogEntry $ view (config.client) serv0
 
   let serv = over log (logMap (++ [LogEntry (view currentTerm serv) nextLogEntry])) serv0
   let update = appendEntriesFromLeader serv [last . logWithIndices $ serv]
@@ -555,28 +608,27 @@ main :: IO ()
 main = do
   args <- getArgs
   case args of
-   (myId:"test":_) -> testMain . fromIntegral . read $ myId
-
-   (myId:"log":_) -> do
-     let sid = fromIntegral . read $ myId
-     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig SimpleIncrementingClient JsonStorage NilConnection String)
-     lg <- view log <$> (fromPersist . initializeFollower $ conf)
-     logMain sid lg
-
-   (myId:"leader":_) -> do
+   (myId:rest) -> do
      let sid = fromIntegral . read $ myId
      conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig SimpleIncrementingClient JsonStorage HandleConnection String)
      serv <- fromPersist . initializeFollower $ conf
-     void $ debugMain leaderMain (promoteToLeader serv)
+     case rest of
+      ("test":_) -> testMain sid
 
-   (myId:_) -> do
-     let sid = fromIntegral . read $ myId
-     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig SimpleIncrementingClient JsonStorage NilConnection String)
-     serv <- fromPersist . initializeFollower $ conf
-     void $ debugMain followerMain serv
+      ("log":_) -> logMain sid $ view log serv
 
-   _ -> error "Invalid arguments."
+      ("leader":_) -> void $ debugMain leaderMain (promoteToLeader serv)
 
+      ("candidate":_) -> void $ debugMain candidateMain (nominateToCandidate serv)
+
+      ("follower":_) -> defaultToFollower serv
+
+      [] -> defaultToFollower serv
+
+      _ -> error "Invalid argument: startup command not found."
+
+   _ -> error "Invalid argument: server id required."
+  where defaultToFollower = void . debugMain followerMain
 
 -- Testing and testing utils
 

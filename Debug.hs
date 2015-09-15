@@ -8,7 +8,7 @@ debug err = debug' (err ++ "\n")
 
 {-# NOINLINE debug' #-}
 debug' :: String -> a -> a
-debug' _ = id -- Disable debug log globally
+-- debug' _ = id -- Disable debug log globally
 debug' err  = (unsafePerformIO (putStr err >> hFlush stdout) `seq`)
 
 -- Debug helpers
