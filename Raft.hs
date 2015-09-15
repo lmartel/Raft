@@ -116,15 +116,13 @@ expectResponsesTo msgs = get >>= put . over outstanding multiInsert
 
 --- Sending messages from Leader to self-as-Follower
 
-instance (ToJSON a, FromJSON a, Show a) => Connection (SelfConnection (Server cl s c a)) where
+instance (Persist s, ToJSON a, FromJSON a, Show a) => Connection (SelfConnection (Server cl s c a)) where
   fromConfig = undefined
 
   respond msg (SelfConnection servBox respQ qNotEmpty) = do
     serv <- takeMVar servBox
     let (mResp, serv') = runState (handleRequest msg) serv
-    -- persist serv' -- TODO figure out whether to persist here or on leader after receiving client update
-    -- TODO is the problem lazy evaluation of mResp? try using strict list for queue
-
+    persist serv'
     putMVar servBox serv'
     maybe (return ()) (\resp -> resp `seq` snocQueue respQ resp >> tryPutMVar qNotEmpty () >> return ()) mResp
 
@@ -580,7 +578,7 @@ cohortListeners serv = map listenForResponseOnce $ cohortConnections serv
   where cohortConnections :: Server cl s c a -> [c]
         cohortConnections = map snd . Map.toList . view (config.cohorts)
 
-broadcastThread :: (ClientConnection cl a, Connection c, ToJSON a, FromJSON a, Show a) =>
+broadcastThread :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
                    IORef MessageId -> MVar (Server cl s c a) -> IO ()
 broadcastThread nextMessageId servBox = do
   serv0 <- takeMVar servBox
@@ -589,7 +587,8 @@ broadcastThread nextMessageId servBox = do
   putMVar servBox serv'
   leaderLoop nextMessageId servBox
 
-leaderLoop :: (ClientConnection cl a, Connection c, ToJSON a, FromJSON a, Show a) => IORef MessageId -> MVar (Server cl s c a) -> IO ()
+leaderLoop :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
+              IORef MessageId -> MVar (Server cl s c a) -> IO ()
 leaderLoop nextMid servBox = do
   nextLogEntry <- getLogEntry =<< view (config.client) <$> readMVar servBox
   serv0 <- takeMVar servBox

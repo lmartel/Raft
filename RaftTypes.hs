@@ -20,7 +20,6 @@ import Data.Text.Lazy.Encoding
 import qualified Data.Text.Lazy as Text
 import qualified Data.ByteString.Lazy as BS
 
-
 newtype MessageId = MessageId Integer
                   deriving (Eq, Ord, Show, Num, Enum, Generic)
 newtype Term = Term Integer
