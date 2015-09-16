@@ -77,7 +77,9 @@ instance Connection SimpleHandleConnection where
   fromConfig = undefined
 
   respond msg (SimpleHandleConnection hdl) = respondMaybe' msg (Just hdl) `catch` exitOnError
-  listen (SimpleHandleConnection hdl) = listenMaybe' (Just hdl) `catch` (\ex -> exitOnError ex >> return Nothing)
+  listen (SimpleHandleConnection hdl) = do
+    hIsEOF hdl >>= flip when (debug "Leader disconnected." myThreadId >>= killThread)
+    listenMaybe' (Just hdl) `catch` (\ex -> exitOnError ex >> return Nothing)
 
 
 exitOnError :: IOError -> IO ()
@@ -107,8 +109,7 @@ connectHandle :: Bool -> CohortConfig -> IO (Maybe Handle)
 connectHandle verbose conf@(CohortConfig _ host portNum) =
   catch (do
     hdl <- connectHandle'
-    tid <- myThreadId
-    when verbose $ putStrLn ("Connected to follower at " ++ host ++ ":" ++ show portNum ++ "." ++ "[" ++ show tid ++ "]")
+    when verbose $ putStrLn ("Connected to follower at " ++ host ++ ":" ++ show portNum ++ ".")
     return (Just hdl)
   ) (\ex -> debugConnectError verbose conf ex >> return Nothing)
   where connectHandle' :: IO Handle
