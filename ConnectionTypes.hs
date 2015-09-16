@@ -76,9 +76,12 @@ data SimpleHandleConnection = SimpleHandleConnection Handle
 instance Connection SimpleHandleConnection where
   fromConfig = undefined
 
-  respond msg (SimpleHandleConnection hdl) = respondMaybe' msg (Just hdl)
-  listen (SimpleHandleConnection hdl) = listenMaybe' (Just hdl)
+  respond msg (SimpleHandleConnection hdl) = respondMaybe' msg (Just hdl) `catch` exitOnError
+  listen (SimpleHandleConnection hdl) = listenMaybe' (Just hdl) `catch` (\ex -> exitOnError ex >> return Nothing)
 
+
+exitOnError :: IOError -> IO ()
+exitOnError ex = debug (show ex) $ myThreadId >>= killThread
 
 -- Handle with reconnection capability.
 -- Used by Leaders to send requests to Followers.

@@ -10,6 +10,7 @@ RUN export PATH=/opt/ghc/7.10.2/bin/:$PATH; cabal-1.22 install network
 RUN export PATH=/opt/ghc/7.10.2/bin/:$PATH; cabal-1.22 install HUnit
 RUN export PATH=/opt/ghc/7.10.2/bin/:$PATH; cabal-1.22 install lens
 RUN export PATH=/opt/ghc/7.10.2/bin/:$PATH; cabal-1.22 install aeson
+RUN export PATH=/opt/ghc/7.10.2/bin/:$PATH; cabal-1.22 install random
 
 WORKDIR /raft
 COPY Gemfile /raft/Gemfile

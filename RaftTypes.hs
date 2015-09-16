@@ -4,6 +4,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 module RaftTypes where
+
 import qualified Prelude (log)
 import Prelude hiding (log)
 import Data.Map (Map)
@@ -81,7 +82,7 @@ instance FromJSON NilEntry where
 
 data MessageType = AppendEntries | AppendEntriesResponse
                  | RequestVote | RequestVoteResponse
-                 deriving (Show, Generic)
+                 deriving (Show, Eq, Generic)
 
 isRequest :: MessageType -> Bool
 isRequest AppendEntries = True
@@ -169,6 +170,7 @@ data OwnFollower = OwnFollower {
   _of_queueNotEmpty :: MVar ()
   }
 
+{-# NOINLINE newOwnFollower #-}
 newOwnFollower :: IO OwnFollower
 newOwnFollower = OwnFollower <$> newMVar [] <*> newEmptyMVar
 

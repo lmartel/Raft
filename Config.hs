@@ -1,31 +1,37 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Config where
-import Data.Aeson
 import Control.Monad
+import Data.Aeson
 
 import RaftTypes
 
+type Millisec = Float
 type Microsec = Int
 
+realtimeRatio :: Float
+realtimeRatio = 1 / 20 -- "Slow-mo"
+-- realtimeRatio = 1       -- Production speed
+
+milli :: Millisec -> Microsec
+milli = round . (/ realtimeRatio) . (* 1000)
+
 kReconnect :: Microsec
--- kReconnect = 200000
-kReconnect = 1500000
+kReconnect = milli 100
 
 kGenerateClientUpdates :: Microsec
-kGenerateClientUpdates = 700000
--- kGenerateClientUpdates = 4000000
+kGenerateClientUpdates = milli 700
 
 kCommitReport :: Microsec
-kCommitReport = 1500000
+kCommitReport = milli 1000
 
 kHeartbeat :: Microsec
-kHeartbeat = 300000
+kHeartbeat = milli 100
 
 kTimeoutMin :: Microsec
-kTimeoutMin = 300000
+kTimeoutMin = milli 300
 
 kTimeoutMax :: Microsec
-kTimeoutMax = 500000
+kTimeoutMax = milli 500
 
 instance ToJSON CohortConfig where
   toJSON (CohortConfig sid host port) = object [

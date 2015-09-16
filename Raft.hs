@@ -16,6 +16,7 @@ import Data.List
 import Data.IORef
 import Data.Maybe
 import Data.Either
+import Data.Time
 import Control.Monad.State
 import System.IO.Unsafe
 import Data.Map (Map)
@@ -23,6 +24,7 @@ import qualified Data.Map as Map
 import qualified Data.ByteString.Lazy as ByteString
 import System.Posix.Signals
 import System.IO
+import System.Random
 import Network.Socket hiding (listen)
 import qualified Network.Socket as Sock (listen)
 
@@ -60,25 +62,41 @@ initializeFollower conf = Server {
 
 demoteToFollower :: Server cl s c a -> Server cl s c a
 demoteToFollower = set (config.role) Follower
+                   . set (config.ownFollower) Nothing
                    . set nextIndex Nothing
                    . set matchIndex Nothing
                    . set outstanding Map.empty
 
-promoteToLeader :: Server cl s c a -> Server cl s c a
-promoteToLeader old = set (config.role) Leader
-                      . set nextIndex (Just nis)
-                      . set matchIndex (Just mis)
-                      $ serv
-  where serv = demoteToFollower old
-        nis :: ServerMap LogIndex
-        nis = Map.map (\_ -> viewLastLogIndex serv) . view (config.cohorts) $ serv
-        mis :: ServerMap LogIndex
-        mis = Map.map (\_ -> LogIndex 0) . view (config.cohorts) $ serv
+promoteToLeader :: Server cl s c a -> IO (Server cl s c a)
+promoteToLeader old = newOwnFollower >>= \fol -> return $
+                                                 set (config.role) Leader
+                                                 . set (config.ownFollower) (Just fol)
+                                                 . set nextIndex (Just nis)
+                                                 . set matchIndex (Just mis)
+                                                 $ demoted
+  where demoted = if view (config.role) old == Leader
+                  then error "promoteToLeader :: server is already leader"
+                  else demoteToFollower old
 
-nominateToCandidate :: Server cl s c a -> Server cl s c a
-nominateToCandidate = over currentTerm (+ 1)
-                      . set (config.role) (Candidate Map.empty)
-                      . demoteToFollower
+        nis :: ServerMap LogIndex
+        nis = Map.map (\_ -> viewLastLogIndex demoted) . view (config.cohorts) $ demoted
+        mis :: ServerMap LogIndex
+        mis = Map.map (\_ -> LogIndex 0) . view (config.cohorts) $ demoted
+
+-- Candidates can be re-nominated; the SelfConnection should be recycled in this case,
+-- because the renomination does not restart the process.
+nominateToCandidate :: Server cl s c a -> IO (Server cl s c a)
+nominateToCandidate old = getOwnFollower >>= \fol -> return $
+                                                 over currentTerm (+ 1)
+                                                 . set votedFor Nothing
+                                                 . set (config.ownFollower) fol
+                                                 . set (config.role) (Candidate Map.empty)
+                                                 . demoteToFollower
+                                                 $ old
+  where getOwnFollower = case view (config.role) old of
+          (Candidate _) -> return $ view (config.ownFollower) old
+          _ -> Just <$> newOwnFollower
+
 
 --- Sending/receiving messages
 
@@ -136,33 +154,38 @@ instance (Persist s, ToJSON a, FromJSON a, Show a) => Connection (SelfConnection
 
 --- Raft algorithm core
 
+
+checkOutOfDate :: Maybe Term -> Raft cl s c a Bool
+checkOutOfDate Nothing = return False
+checkOutOfDate (Just theirTerm) = do
+  me <- get
+  let outOfDate = view currentTerm me < theirTerm
+  when outOfDate
+    (put . set votedFor Nothing . set currentTerm theirTerm . demoteToFollower $ me)
+  return outOfDate
+
+-- Check and handle out-of-date, but process either way.
 handleRequest :: (FromJSON a) => Message -> Raft cl s c a (Maybe Message)
-handleRequest msg = case view msgType msg of
-  AppendEntries -> debug' "AppendEntries. " (Just <$> processAppendEntries msg)
-  RequestVote -> debug' "RequestVote. " (Just <$> processRequestVote msg)
+handleRequest msg = fmap Just $ do
+                    checkOutOfDate (term msg)
+                    case debug' "Received request... " view msgType msg of
+                     AppendEntries -> debug' "AppendEntries. " (processAppendEntries msg)
+                     RequestVote -> debug' "RequestVote. " (processRequestVote msg)
 
+
+
+-- Check and handle out-of-date, then process only if up to date.
+
+-- TODO: debug-logging in the response handler is too noisy.
+-- The debug calls are just disabled for now; eventually, I want them piped to a separate file
 handleResponse :: (ClientConnection cl a, FromJSON a, Show a) => Message -> Raft cl s c a ()
-handleResponse msg = do
-  let maybeMalformed = [
-        liftM checkOutOfDate (term msg),
-        handleResponse'
-        ]
-  case sequence maybeMalformed of
-   Nothing -> return ()
-   (Just states) -> sequence_ states
-  where checkOutOfDate :: Term -> Raft cl s c a ()
-        checkOutOfDate followerTerm = do
-             me <- get
-             if view currentTerm me < followerTerm
-               then put . set currentTerm followerTerm . demoteToFollower $ me
-               else put me
-
-        handleResponse' :: (ClientConnection cl a, FromJSON a, Show a) => Maybe (Raft cl s c a ())
+handleResponse msg = checkOutOfDate (term msg) >>= flip unless handleResponse'
+  where handleResponse' :: (ClientConnection cl a, FromJSON a, Show a) => Raft cl s c a ()
         handleResponse' = case view msgType msg of
-                           AppendEntriesResponse -> debug' "AppendEntriesResponse. " $
-                                                    liftM (handleAppendEntriesResponse msg) (success msg)
-                           RequestVoteResponse -> debug' "RequestVoteResponse. " $
-                                                  liftM (handleRequestVoteResponse msg) $ voteGranted msg
+                           AppendEntriesResponse -> -- debug' "Received AppendEntriesResponse. " $
+                             doMaybe (handleAppendEntriesResponse msg) (success msg)
+                           RequestVoteResponse -> -- debug' "Received RequestVoteResponse. " $
+                             doMaybe (handleRequestVoteResponse msg) (voteGranted msg)
 
 -- On failure: decrement nextIndex, retry later
 -- On success: update matchIndex and nextIndex, then resolve (delete) the pending message.
@@ -238,16 +261,13 @@ processAppendEntries :: FromJSON a => Message -> Raft cl s c a Message
 processAppendEntries msg = do
   me <- get
   case validateAppendEntries me msg of
-   Nothing -> do put me
-                 let resp = debugResponse False me
-                 return resp
+   Nothing -> return $ debugResponse False me
    (Just entrs) -> let me' = set currentTerm (fromJust $ term msg)
                              . over log (updateLogWith entrs)
                              . set commitIndex (updateCommitIndex me $ leaderCommit msg)
                              $ me
                    in do put me'
-                         let resp = debugResponse True me'
-                         return resp
+                         return $ debugResponse True me'
   where updateCommitIndex :: Server cl s c a -> Maybe LogIndex -> LogIndex
         updateCommitIndex me Nothing = view commitIndex me
         updateCommitIndex me (Just theirs) = min theirs (viewLastLogIndex me)
@@ -300,15 +320,18 @@ processRequestVote :: FromJSON a => Message -> Raft cl s c a Message
 processRequestVote msg = do
   me <- get
   case validateRequestVote me msg of
-   Nothing -> debug "Failed validation." $ return (response False me)
+   Nothing -> return $ debugResponse False me
    (Just cid) -> let me' = set currentTerm (fromJust $ term msg)
                            . set votedFor (Just cid)
                            $ me
                  in do put me'
-                       debug "Succeeded!" $ return (response True me')
+                       return $ debugResponse True me'
   where response :: Bool -> Server cl s c a -> Message
         response b me = requestVoteResponse (view currentTerm me) b $ responseInfo msg me
 
+        debugResponse :: Bool -> Server cl s c a -> Message
+        debugResponse False = debug "Failed validation." $ response False
+        debugResponse True = debug "Success!" $ response True
 
 validateRequestVote :: FromJSON a => Server cl s c a -> Message -> Maybe ServerId
 validateRequestVote serv msg = case Just . all (== True) =<< sequence [
@@ -346,12 +369,8 @@ configureCohorts conf = liftM Map.fromList $ pure conf
 
 configureSelf :: (ClientConnection cl a, Connection c) => CohortConfig -> ClusterConfig -> s a -> IO (ServerConfig cl s c a)
 configureSelf myConf cluster stor = do
-  self <- Just <$> newOwnFollower
   clust' <- configureCohorts cluster
-  ServerConfig myRole myConf self clust' stor <$> (fromClientConfig $ view clientConfig cluster)
-  where myRole = if view cohortId myConf == view clusterLeader cluster
-                 then Leader
-                 else Follower
+  ServerConfig Follower myConf Nothing clust' stor <$> (fromClientConfig $ view clientConfig cluster)
 
 readJSONConfig :: (ClientConnection cl a, Persist s, Connection c) => String -> ServerId -> IO (ServerConfig cl s c a)
 readJSONConfig f myId = do
@@ -440,42 +459,85 @@ cleanupAndExit serverState workersQueue done = do
 snocQueue :: MVar [a] -> a -> IO ()
 snocQueue q v = takeMVar q >>= putMVar q . (++ [v])
 
+doMaybe :: Monad m => (a -> m ()) -> Maybe a -> m ()
+doMaybe = maybe $ return ()
+
 
 -- Type signature commented out because it needs an explicit FORALL to compile properly and, well, fuck that
 -- listenerFromHandle :: Connection conn => (conn -> MVar (Server cl s c a) -> IO ()) -> Handle -> MVar (Server cl s c a) -> IO ()
 listenerFromHandle listener hdl servBox = forever $ listener (SimpleHandleConnection hdl) servBox
 
 -- Listen for a message, check for relevance, process it.
+-- Including sending a response if necessary.
+-- Return the response as well (if any).
 listenForSomethingOnce :: (ClientConnection cl a, Persist s, Connection conn, FromJSON a, ToJSON a, Show a) =>
                           (Message -> Bool) -> (Message -> Raft cl s c a (Maybe Message)) ->
-                          conn -> MVar (Server cl s c a) -> IO ()
+                          conn -> MVar (Server cl s c a) -> IO (Maybe Message)
 listenForSomethingOnce shouldHandle handler conn servBox = do
   maybeReq <- listen conn
-  maybe retryLater (maybeProcess . debug' "Received request... ") maybeReq
-    where doMaybe :: (a -> IO ()) -> Maybe a -> IO ()
-          doMaybe = maybe $ return ()
+  maybe retryLater maybeProcess maybeReq
+    where retryLater :: IO (Maybe Message)
+          retryLater = threadDelay kReconnect >> return Nothing
 
-          retryLater :: IO ()
-          retryLater = threadDelay kReconnect
-
-          maybeProcess :: Message -> IO ()
+          maybeProcess :: Message -> IO (Maybe Message)
           maybeProcess req
             | shouldHandle req = do
                 serv <- takeMVar servBox
+                let role0 = view (config.role) serv
+
+                -- Handle the message, send response if any
                 let (resp, serv') = runState (handler req) serv
                 persist serv'
-
                 putMVar servBox serv'
                 doMaybe (`respond` conn) resp
-            | otherwise = debug ("Suppressing unexpected message of type " ++ show (view msgType req)) return ()
+
+                -- Check if need to step down
+                when (view (config.role) serv' /= role0) (raiseSignal sigINT)
+
+                return resp
+            | otherwise = debug ("Suppressing unexpected message of type " ++ show (view msgType req)) return Nothing
+
+
+generateRaftTimeout :: IO NominalDiffTime
+generateRaftTimeout = fromRational . toRational . picosecondsToDiffTime . microToPico <$> randomRIO (kTimeoutMin, kTimeoutMax)
+  where microToPico :: Int -> Integer
+        microToPico = (oneMillion *) . fromIntegral
+        oneMillion :: Integer
+        oneMillion = 1000000
+
+
+resetTheTimeout :: MVar UTCTime -> IO ()
+resetTheTimeout timeout = addUTCTime <$> generateRaftTimeout <*> getCurrentTime >>= void . swapMVar timeout
 
 -- Used by Follower coordinator thread to listen for requests (only).
 listenForRequestOnce :: (ClientConnection cl a, Persist s, Connection conn, FromJSON a, ToJSON a, Show a) =>
-                        conn -> MVar (Server cl s c a) -> IO ()
-listenForRequestOnce = listenForSomethingOnce (isRequest . view msgType) handleRequest
+                        Maybe (MVar UTCTime) -> conn -> MVar (Server cl s c a) -> IO ()
+listenForRequestOnce timeout conn servBox = do
+  mResp <- listenForSomethingOnce (isRequest . view msgType) handleRequest conn servBox
+  when (doesAbortCandidacy mResp) stepDownIfCandidate
+  when (doesResetTimeout mResp) (doMaybe resetTheTimeout timeout)
+    where doesResetTimeout :: Maybe Message -> Bool
+          doesResetTimeout Nothing = False
+          doesResetTimeout (Just msg) = case view msgType msg of
+            AppendEntriesResponse -> fromMaybe False (success msg)
+            RequestVoteResponse -> fromMaybe False (voteGranted msg)
+
+          doesAbortCandidacy :: Maybe Message -> Bool
+          doesAbortCandidacy Nothing = False
+          doesAbortCandidacy (Just msg) = view msgType msg == AppendEntriesResponse
+                                          && fromMaybe False (success msg)
+
+          stepDownIfCandidate :: IO ()
+          stepDownIfCandidate = do  -- TODO: don't block on servBox for this?
+            serv <- takeMVar servBox
+            case view (config.role) serv of
+             Candidate _ -> putMVar servBox (demoteToFollower serv) >> raiseSignal sigINT
+             _ -> putMVar servBox serv
+
+
 
 -- TODO use `forever` at toplevel instead of recursion here
--- Used on the Leader only to listen for responses (only).
+-- Used on the Leader and Candidate only, to listen for responses (only).
 listenForResponseOnce :: (ClientConnection cl a, Persist s, Connection conn, FromJSON a, ToJSON a, Show a) =>
                          conn -> MVar (Server cl s c a) -> IO ()
 -- listenForResponseOnce = debug "Listening for response..." $ listenForSomethingOnce (isResponse . view msgType)
@@ -493,20 +555,46 @@ mainForRole serv0 = case view (config.role) serv0 of
   (Candidate _) -> candidateMain serv0
 
 
+newTimeoutTimer :: IO (MVar UTCTime)
+newTimeoutTimer = addUTCTime <$> generateRaftTimeout <*> getCurrentTime >>= newMVar
+
+whenTimedOut :: ServerWorker cl s c a -> MVar UTCTime -> ServerWorker cl s c a
+whenTimedOut handler nextTimeout servBox = do
+  scheduled <- readMVar nextTimeout -- TODO takeMVar?
+  timeLeft <- diffUTCTime scheduled <$> getCurrentTime
+  if timeLeft > 0
+    then threadDelay (secondsToMicrosec timeLeft)
+    else do
+    resetTheTimeout nextTimeout
+    handler servBox
+
+  whenTimedOut handler nextTimeout servBox
+    where secondsToMicrosec :: NominalDiffTime -> Microsec
+          secondsToMicrosec = round . (1000000 *) . toRational
 followerMain :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
                 Server cl s c a -> IO (Server cl s c a)
-followerMain serv0 = withListeners serv0 (listenerFromHandle listenForRequestOnce) []
+followerMain serv0 = newTimeoutTimer >>=
+                     \nextTimeout -> withListeners serv0
+                                     (listenerFromHandle $ listenForRequestOnce (Just nextTimeout))
+                                     [whenTimedOut followerTimeout nextTimeout]
+  where followerTimeout :: ServerWorker cl s c a
+        followerTimeout servBox = debug "~~~ TIMED OUT [FOLLOWER] ~~~"
+                                  $ takeMVar servBox >>= nominateToCandidate >>= putMVar servBox >> raiseSignal sigINT
 
 candidateMain :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
                  Server cl s c a -> IO (Server cl s c a) -- TODO: after successful request, downgrade Role
-candidateMain serv0 = newIORef 0 >>= \(nextMessageId) -> -- TODO: need to persist nextMessageId?
+candidateMain serv0 = (,) <$> newIORef 0 <*> newTimeoutTimer
+                      >>= \(nextMessageId, nextTimeout) -> -- TODO: need to persist nextMessageId?
                       withListeners serv0
-                      (listenerFromHandle listenForRequestOnce)
-                      (voteForMe nextMessageId : selfListener serv0 ++ cohortListeners serv0)
+                      (listenerFromHandle $ listenForRequestOnce (Just nextTimeout))
+                      (voteForMe nextMessageId
+                       : whenTimedOut candidateTimeout nextTimeout
+                       : selfListener serv0 ++ cohortListeners serv0
+                      )
   where voteForMe nextMessageId servBox = do
           serv <- takeMVar servBox
           if amElected serv
-            then putMVar servBox (promoteToLeader serv) >> raiseSignal sigINT
+            then promoteToLeader serv >>= putMVar servBox >> raiseSignal sigINT
             else do
               let voteMsg = requestVoteFromCandidate serv
               let self = fromJust $ view (config.ownFollower) serv
@@ -516,6 +604,11 @@ candidateMain serv0 = newIORef 0 >>= \(nextMessageId) -> -- TODO: need to persis
               respond selfVote $ selfConnection servBox self
               threadDelay kHeartbeat
               voteForMe nextMessageId servBox
+
+        candidateTimeout :: ServerWorker cl s c a
+        candidateTimeout servBox = debug "~~~ TIMED OUT [CANDIDATE] ~~~"
+                                   $ takeMVar servBox >>= nominateToCandidate >>= putMVar servBox
+
 
         amElected :: Server cl s c a -> Bool
         amElected me = case view (config.role) me of
@@ -528,10 +621,8 @@ leaderMain :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSO
               Server cl s c a -> IO (Server cl s c a)
 leaderMain serv0 = newIORef 0 >>= \midGen ->
   withListeners serv0 -- TODO: need to persist nextMessageId?
-  (listenerFromHandle listenForRequestOnce)
+  (listenerFromHandle $ listenForRequestOnce Nothing)
   (broadcastThread midGen : heartbeatThread midGen : commitReporter : selfListener serv0 ++ cohortListeners serv0)
---  (\_ _ -> return ())
---  (broadcastThread midGen : cohortListeners serv0)
 
 -- This thread is responsible for resending unsuccessful AppendEntries requests,
 -- and sending heartbeats (empty requests) to caught-up followers to reset their election timeout
@@ -568,7 +659,7 @@ commitReporter servBox = do
 selfListener :: (ClientConnection cl a, Persist s, FromJSON a, ToJSON a, Show a) =>
                 Server cl s c a -> [ServerWorker cl s c a]
 selfListener serv0 = case view (config.ownFollower) serv0 of
-                Nothing -> []
+                Nothing -> error "selfListener :: No SelfConnection to listen to"
                 (Just self) -> [\servBox -> listenForResponseOnce (selfConnection servBox self) servBox]
 
 
@@ -618,9 +709,9 @@ main = do
 
       ("log":_) -> logMain sid $ view log serv
 
-      ("leader":_) -> void $ debugMain leaderMain (promoteToLeader serv)
+      ("leader":_) -> void $ debugMain leaderMain =<< promoteToLeader serv
 
-      ("candidate":_) -> void $ debugMain candidateMain (nominateToCandidate serv)
+      ("candidate":_) -> void $ debugMain candidateMain =<< nominateToCandidate serv
 
       ("follower":_) -> defaultToFollower serv
 
@@ -696,7 +787,6 @@ instance (ToJSON a, FromJSON a, Show a, Persist s) => Connection (InMemoryConnec
 
   fromConfig conf@(CohortConfig sid host port) = do
     mid <- newIORef 0
-    fol <- newOwnFollower
     serv <- newIORef . initializeFollower $ ServerConfig Follower conf Nothing Map.empty (fromName storageName) AbortClient
     return $ InMemoryConnection serv mid
     where storageName = kLogDir ++ host ++ "_" ++ show port ++ ".local.json"
@@ -718,9 +808,9 @@ simpleConfig = ClusterConfig {
 testLocalSystemWith :: Log String -> ServerId -> IO (Server AbortClient JsonStorage (InMemoryConnection AbortClient JsonStorage NilConnection String) String)
 testLocalSystemWith lg myId = do
   conf <- readJSONConfig (kConfigFile myId) myId
-  let serv = initializeFollower conf
+  serv <- promoteToLeader $ initializeFollower conf
   case view role conf of
-   Leader -> leaderMain . injectPersistentState (1, Just myId, lg) . promoteToLeader $ serv
+   Leader -> leaderMain . injectPersistentState (1, Just myId, lg) $ serv
 
 
 writeTestConfig :: ClusterConfig -> IO ()
