@@ -262,7 +262,7 @@ processAppendEntries msg = do
   me <- get
   case validateAppendEntries me msg of
    Nothing -> return $ debugResponse False me
-   (Just entrs) -> let me' = set currentTerm (fromJust $ term msg)
+   (Just entrs) -> let me' = set currentTerm (assertJust "processAppendEntries :: validation error" $ term msg)
                              . over log (updateLogWith entrs)
                              . set commitIndex (updateCommitIndex me $ leaderCommit msg)
                              $ me
@@ -321,7 +321,7 @@ processRequestVote msg = do
   me <- get
   case validateRequestVote me msg of
    Nothing -> return $ debugResponse False me
-   (Just cid) -> let me' = set currentTerm (fromJust $ term msg)
+   (Just cid) -> let me' = set currentTerm (assertJust "processRequestVote :: validation error" $ term msg)
                            . set votedFor (Just cid)
                            $ me
                  in do put me'
@@ -403,9 +403,6 @@ debugMain mainFn serv0 = do
 
 type ServerWorker cl s c a = (MVar (Server cl s c a)) -> IO ()
 type ServerListener cl s c a = Handle -> ServerWorker cl s c a
-
--- takeMVar' :: MVar a -> IO a
--- takeMVar' mv = fromJust <$> tryTakeMVar mv
 
 withListeners :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
                  Server cl s c a -> ServerListener cl s c a -> [ServerWorker cl s c a] -> IO (Server cl s c a)
@@ -596,7 +593,7 @@ candidateMain serv0 = (,) <$> newIORef 0 <*> newTimeoutTimer
             then promoteToLeader serv >>= putMVar servBox >> raiseSignal sigINT
             else do
               let voteMsg = requestVoteFromCandidate serv
-              let self = fromJust $ view (config.ownFollower) serv
+              let self = assertJust "voteForMe :: no SelfConnection" $ view (config.ownFollower) serv
               selfVote <- voteMsg <$> requestInfo nextMessageId serv
 
               putMVar servBox =<< execState (expectResponsesTo [selfVote]) <$> broadcast nextMessageId voteMsg serv
@@ -635,7 +632,7 @@ heartbeatThread midGen servBox = do
   serv0 <- takeMVar servBox
   heartbeats <- mapM (finalizeHeartbeat serv0)
                 . mapMaybe (customizeHeartbeat serv0)
-                . Map.toList . fromJust $ view nextIndex serv0
+                . Map.toList . assertJust "heartbeatThread :: no nextIndex" $ view nextIndex serv0
   let serv' = execState (expectResponsesTo $ map snd heartbeats) serv0
   putMVar servBox serv'
   mapM_ (uncurry $ flip respond) heartbeats
@@ -699,7 +696,7 @@ leaderLoop nextMid servBox = do
 
   let serv = over log (logMap (++ [LogEntry (view currentTerm serv) nextLogEntry])) serv0
   let update = appendEntriesFromLeader serv [last . logWithIndices $ serv]
-  let self = fromJust $ view (config.ownFollower) serv
+  let self = assertJust "leaderLoop :: no SelfConnection" $ view (config.ownFollower) serv
   selfUpdate <- update <$> requestInfo nextMid serv
 
   serv' <- execState (expectResponsesTo [selfUpdate]) <$> broadcast nextMid update serv
