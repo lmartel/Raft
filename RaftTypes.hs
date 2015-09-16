@@ -258,6 +258,9 @@ logWithIndices = withIndices . view log
 serverCohorts :: Server cl s c a -> [c]
 serverCohorts = map snd . Map.toList . view (config.cohorts)
 
+otherCohortIds :: Server cl s c a -> [ServerId]
+otherCohortIds = map fst . Map.toList . view (config.cohorts)
+
 termAtIndex :: LogIndex -> Server cl s c a -> Maybe Term
 termAtIndex 0 _ = Just 0
 termAtIndex i s = entry i (view log s) >>= Just . view entryTerm

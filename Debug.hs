@@ -2,6 +2,10 @@ module Debug where
 import System.IO
 import System.IO.Unsafe
 
+assertJust :: String -> Maybe a -> a
+assertJust _ (Just x) = x
+assertJust err Nothing = error err
+
 {-# NOINLINE debug #-}
 debug :: String -> a -> a
 debug err = debug' (err ++ "\n")

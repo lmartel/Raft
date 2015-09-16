@@ -536,14 +536,13 @@ listenForRequestOnce timeout conn servBox = do
 
 
 
--- TODO use `forever` at toplevel instead of recursion here
 -- Used on the Leader and Candidate only, to listen for responses (only).
 listenForResponseOnce :: (ClientConnection cl a, Persist s, Connection conn, FromJSON a, ToJSON a, Show a) =>
                          conn -> MVar (Server cl s c a) -> IO ()
--- listenForResponseOnce = debug "Listening for response..." $ listenForSomethingOnce (isResponse . view msgType)
-listenForResponseOnce conn servBox = do
-  listenForSomethingOnce (isResponse . view msgType) (\resp -> handleResponse resp >> return Nothing) conn servBox
-  listenForResponseOnce conn servBox
+listenForResponseOnce conn serv = void $
+                                  listenForSomethingOnce (isResponse . view msgType)
+                                  (\resp -> handleResponse resp >> return Nothing)
+                                  conn serv
 
 --- Main functions for each role
 
@@ -589,7 +588,7 @@ candidateMain serv0 = (,) <$> newIORef 0 <*> newTimeoutTimer
                       (listenerFromHandle $ listenForRequestOnce (Just nextTimeout))
                       (voteForMe nextMessageId
                        : whenTimedOut candidateTimeout nextTimeout
-                       : selfListener serv0 ++ cohortListeners serv0
+                       : selfListener : cohortListeners (otherCohortIds serv0)
                       )
   where voteForMe nextMessageId servBox = do
           serv <- takeMVar servBox
@@ -620,9 +619,13 @@ candidateMain serv0 = (,) <$> newIORef 0 <*> newTimeoutTimer
 leaderMain :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
               Server cl s c a -> IO (Server cl s c a)
 leaderMain serv0 = newIORef 0 >>= \midGen ->
-  withListeners serv0 -- TODO: need to persist nextMessageId?
+  withListeners serv0
   (listenerFromHandle $ listenForRequestOnce Nothing)
-  (broadcastThread midGen : heartbeatThread midGen : commitReporter : selfListener serv0 ++ cohortListeners serv0)
+  (broadcastThread midGen
+   : heartbeatThread midGen
+   : commitReporter
+   : selfListener : cohortListeners (otherCohortIds serv0)
+  )
 
 -- This thread is responsible for resending unsuccessful AppendEntries requests,
 -- and sending heartbeats (empty requests) to caught-up followers to reset their election timeout
@@ -651,23 +654,33 @@ commitReporter :: (ClientConnection cl a, Show a) => ServerWorker cl s c a
 commitReporter servBox = do
   serv <- takeMVar servBox
   let latestCommitted = view entryData <$> view commitIndex serv `entry` view log serv
-  maybe (return ()) (`committed` view (config.client) serv) latestCommitted
+  doMaybe (`committed` view (config.client) serv) latestCommitted
   putMVar servBox serv
   threadDelay kCommitReport
   commitReporter servBox
 
 selfListener :: (ClientConnection cl a, Persist s, FromJSON a, ToJSON a, Show a) =>
-                Server cl s c a -> [ServerWorker cl s c a]
-selfListener serv0 = case view (config.ownFollower) serv0 of
-                Nothing -> error "selfListener :: No SelfConnection to listen to"
-                (Just self) -> [\servBox -> listenForResponseOnce (selfConnection servBox self) servBox]
+                ServerWorker cl s c a
+selfListener servBox = do
+  serv <- takeMVar servBox
+  let self = assertJust "selfListener :: No SelfConnection to listen to"
+             $ view (config.ownFollower) serv
+  putMVar servBox serv
+  listenForResponseOnce (selfConnection servBox self) servBox
+  selfListener servBox
 
 
 cohortListeners :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
-                   Server cl s c a -> [ServerWorker cl s c a]
-cohortListeners serv = map listenForResponseOnce $ cohortConnections serv
-  where cohortConnections :: Server cl s c a -> [c]
-        cohortConnections = map snd . Map.toList . view (config.cohorts)
+                   [ServerId] -> [ServerWorker cl s c a]
+cohortListeners = map listenForResponsesFrom
+  where listenForResponsesFrom sid servBox = do
+          serv <- takeMVar servBox
+          let conn = assertJust "cohortListeners :: unknown ServerId"
+                     $ sid `Map.lookup` view (config.cohorts) serv
+          putMVar servBox serv
+          listenForResponseOnce conn servBox
+          listenForResponsesFrom sid servBox
+
 
 broadcastThread :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
                    IORef MessageId -> MVar (Server cl s c a) -> IO ()
