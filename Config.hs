@@ -48,16 +48,14 @@ instance FromJSON CohortConfig where
   parseJSON _ = mzero
 
 instance ToJSON ClusterConfig where
-  toJSON (ClusterConfig ldr cl cs) = object [
-    "leader" .= ldr
-    , "client" .= cl
+  toJSON (ClusterConfig cl cs) = object [
+    "client" .= cl
     , "servers" .= cs
     ]
 
 instance FromJSON ClusterConfig where
   parseJSON (Object v) = ClusterConfig
-                         <$> v .: "leader"
-                         <*> v .: "client"
+                         <$> v .: "client"
                          <*> v .: "servers"
   parseJSON _ = mzero
 

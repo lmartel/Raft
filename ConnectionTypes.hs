@@ -81,7 +81,7 @@ instance Connection SimpleHandleConnection where
 
 
 exitOnError :: IOError -> IO ()
-exitOnError ex = debug (show ex) $ myThreadId >>= killThread
+exitOnError ex = debug ("SimpleHandleConnection :: " ++ show ex) $ myThreadId >>= killThread
 
 -- Handle with reconnection capability.
 -- Used by Leaders to send requests to Followers.

@@ -146,7 +146,6 @@ data CohortConfig = CohortConfig {
   } deriving (Eq, Show, Generic)
 makeLenses ''CohortConfig
 data ClusterConfig = ClusterConfig {
-  _clusterLeader :: ServerId,
   _clientConfig :: ClientConfig,
   _clusterServers :: [CohortConfig]
   } deriving (Eq, Show, Generic)

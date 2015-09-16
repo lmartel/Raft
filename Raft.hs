@@ -796,7 +796,6 @@ instance Show a => Show (InMemoryConnection cl s c a) where
 
 simpleConfig :: ClusterConfig
 simpleConfig = ClusterConfig {
-    _clusterLeader = 1,
     _clientConfig = ClientConfig "localhost" 3000,
     _clusterServers = [
       CohortConfig 1 "localhost" 3001,
