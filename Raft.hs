@@ -25,6 +25,7 @@ import qualified Data.ByteString.Lazy as ByteString
 import System.Posix.Signals
 import System.IO
 import System.Random
+import System.Exit
 import Network.Socket hiding (listen)
 import qualified Network.Socket as Sock (listen)
 
@@ -36,6 +37,7 @@ import ConnectionTypes
 import JsonStorage
 import Config
 import Debug
+import ExitCodes
 
 --- The strict-concurrency package is out-of-date, so we roll our own:
 
@@ -385,20 +387,27 @@ readJSONConfig f myId = do
         filterMe :: ServerId -> ClusterConfig -> ClusterConfig
         filterMe sid = over clusterServers (filter ((/= sid) . view cohortId))
 
-debugMain :: (Show c, Show a) => (Server cl s c a -> IO (Server cl s c a)) -> Server cl s c a -> IO (Server cl s c a)
-debugMain mainFn serv0 = do
-  putStrLn $ "===== " ++ servInfo serv0 ++ " STARTING ====="
+debugServInfo :: (Show a) => Server cl s c a -> String
+debugServInfo serv = show (view serverId serv) ++ " " ++ show (view (config.role) serv)
+
+debugMainStarting :: (Show a) => Server cl s c a -> IO ()
+debugMainStarting serv0 = do
+  putStrLn $ "===== " ++ debugServInfo serv0 ++ " STARTING ====="
   print $ view config serv0
   print serv0
 
-  serv' <- mainFn serv0
-
-  putStrLn $ "===== " ++ servInfo serv' ++ " FINISHING ====="
+debugMainFinishing :: (Show a) => Server cl s c a -> IO ()
+debugMainFinishing serv' = do
+  putStrLn $ "===== " ++ debugServInfo serv' ++ " FINISHING ====="
   print serv'
   putStrLn "===== ALL DONE ====="
 
+debugMain :: (Show a) => (Server cl s c a -> IO (Server cl s c a)) -> Server cl s c a -> IO (Server cl s c a)
+debugMain mainFn serv0 = do
+  debugMainStarting serv0
+  serv' <- mainFn serv0
+  debugMainFinishing serv'
   return serv'
-  where servInfo serv = show (view serverId serv) ++ " " ++ show (view (config.role) serv)
 
 
 type ServerWorker cl s c a = (MVar (Server cl s c a)) -> IO ()
@@ -432,8 +441,8 @@ withListeners serv0 acceptFn otherFns = do
   serv' <- takeMVar serverState
   let newRole = view (config.role) serv'
     in if initialRole /= newRole
-       then debug ("Restaring with new role: " ++ show newRole) mainForRole serv'
-       else return serv'
+       then debug ("Restaring with new role: " ++ show newRole) exitWith (codeForRole newRole)
+       else debugMainFinishing serv' >> exitWith processDone
   where spawnerThread sock serverState workerThreads = do
           (sock', _) <- accept sock
           hdl <- debug "Listener accepted connection." $ socketToHandle sock' ReadWriteMode
@@ -569,7 +578,7 @@ whenTimedOut handler nextTimeout servBox = do
           secondsToMicrosec = round . (1000000 *) . toRational
 followerMain :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJSON a, Show a) =>
                 Server cl s c a -> IO (Server cl s c a)
-followerMain serv0 = newTimeoutTimer >>=
+followerMain serv0 = debug "Follower listening." newTimeoutTimer >>=
                      \nextTimeout -> withListeners serv0
                                      (listenerFromHandle $ listenForRequestOnce (Just nextTimeout))
                                      [whenTimedOut followerTimeout nextTimeout]
@@ -719,9 +728,9 @@ main = do
 
       ("log":_) -> logMain sid $ view log serv
 
-      ("leader":_) -> void $ debugMain leaderMain =<< promoteToLeader serv
+      ("leader":_) -> void $ leaderMain =<< promoteToLeader serv
 
-      ("candidate":_) -> void $ debugMain candidateMain =<< nominateToCandidate serv
+      ("candidate":_) -> void $ candidateMain =<< nominateToCandidate serv
 
       ("follower":_) -> defaultToFollower serv
 
@@ -730,7 +739,7 @@ main = do
       _ -> error "Invalid argument: startup command not found."
 
    _ -> error "Invalid argument: server id required."
-  where defaultToFollower = void . debugMain followerMain
+  where defaultToFollower = void . followerMain
 
 -- Testing and testing utils
 
