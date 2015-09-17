@@ -461,7 +461,7 @@ cleanupAndExit serverState workersQueue done = do
 
   putMVar workersQueue []
   putMVar serverState serverLock
-  putMVar done ()
+  void $ tryPutMVar done ()
 
 snocQueue :: MVar [a] -> a -> IO ()
 snocQueue q v = takeMVar q >>= putMVar q . (++ [v])
@@ -582,7 +582,7 @@ followerMain :: (ClientConnection cl a, Persist s, Connection c, ToJSON a, FromJ
 followerMain serv0 = debug "Follower listening." newTimeoutTimer >>=
                      \nextTimeout -> withListeners serv0
                                      (listenerFromHandle $ listenForRequestOnce (Just nextTimeout))
-                                     [whenTimedOut followerTimeout nextTimeout]
+                                     [whenTimedOut followerTimeout nextTimeout, commitReporter]
   where followerTimeout :: ServerWorker cl s c a
         followerTimeout servBox = debug "~~~ TIMED OUT [FOLLOWER] ~~~"
                                   $ takeMVar servBox >>= nominateToCandidate >>= putMVar servBox >> raiseSignal sigINT
@@ -595,6 +595,7 @@ candidateMain serv0 = (,) <$> newIORef 0 <*> newTimeoutTimer
                       (listenerFromHandle $ listenForRequestOnce (Just nextTimeout))
                       (voteForMe nextMessageId
                        : whenTimedOut candidateTimeout nextTimeout
+                       : commitReporter
                        : selfListener : cohortListeners (otherCohortIds serv0)
                       )
   where voteForMe nextMessageId servBox = do
@@ -724,27 +725,33 @@ main = do
    (myId:rest) -> do
 
      let sid = fromIntegral . read $ myId :: ServerId
---     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig SimpleIncrementingClient JsonStorage HandleConnection String)
-     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig GetlineClient JsonStorage HandleConnection Int)
-     serv <- fromPersist . initializeFollower $ conf
+     defaultServ <- servReportOnly sid
      case rest of
       ("test":_) -> testMain sid
 
-      ("log":_) -> logMain sid $ view log serv
+      ("log":_) -> logMain sid $ view log defaultServ
 
-      ("leader":_) -> void $ leaderMain =<< promoteToLeader serv
+      ("leader":_) -> void $ leaderMain =<< promoteToLeader =<< servWithClient sid
 
-      ("candidate":_) -> void $ candidateMain =<< nominateToCandidate serv
+      ("candidate":_) -> void $ candidateMain =<< nominateToCandidate defaultServ
 
-      ("follower":_) -> defaultToFollower serv
+      ("follower":_) -> defaultToFollower defaultServ
 
-      [] -> defaultToFollower serv
+      [] -> defaultToFollower defaultServ
 
       _ -> error "Invalid argument: startup command not found."
 
    _ -> error "Invalid argument: server id required."
   where defaultToFollower = void . followerMain
+        servWithClient sid = do
+          --     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig SimpleIncrementingClient JsonStorage HandleConnection String)
 
+          conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig GetlineClient JsonStorage HandleConnection Int)
+          fromPersist . initializeFollower $ conf
+
+        servReportOnly sid = do
+          conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig ReportOnlyClient JsonStorage HandleConnection Int)
+          fromPersist . initializeFollower $ conf
 -- Testing and testing utils
 
 logMain :: Show a => ServerId -> Log a -> IO ()

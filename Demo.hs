@@ -9,17 +9,39 @@ import System.IO
 import ConnectionTypes
 
 data GetlineClient a = GetlineClient {
-  latestValue :: IORef (Maybe a)
+  gl_latestValue :: IORef (Maybe a)
   }
 
-newGetlineClient :: IO (GetlineClient a)
-newGetlineClient = GetlineClient <$> newIORef Nothing
+demoReportVal :: Show a => a -> IO ()
+demoReportVal new = putStrLn $ "\r!! CURRENT COMMITTED VALUE: " ++ show new
 
-instance (Read a, Eq a) => ClientConnection GetlineClient a where
-  fromClientConfig _ = newGetlineClient
+instance (Read a, Eq a, Show a) => ClientConnection GetlineClient a where
+  fromClientConfig _ = GetlineClient <$> newIORef Nothing
 
-  getLogEntry _ = putStr "> " >> hFlush stdout >> (read <$> getLine)
+  getLogEntry cl@(GetlineClient stor) = do
+    putStr "> "
+    hFlush stdout
+    ln <- getLine
+    if null ln
+      then do
+      prev <- readIORef stor
+      maybe (return ()) demoReportVal prev
+      getLogEntry cl
+      else return $ read ln
 
   committed val cli = do
-    oldStored <- atomicModifyIORef' (latestValue cli) (\old -> (Just val, old))
-    when (oldStored /= Just val) $ putStrLn ("\r!! COMMITTED: " ++ show val) >> putStr "> " >> hFlush stdout
+    oldStored <- atomicModifyIORef' (gl_latestValue cli) (\old -> (Just val, old))
+    when (oldStored /= Just val) $ demoReportVal val >> putStr "> " >> hFlush stdout
+
+data ReportOnlyClient a = ReportOnlyClient {
+  ro_latestValue :: IORef (Maybe a)
+  }
+
+instance (Eq a, Show a) => ClientConnection ReportOnlyClient a where
+  fromClientConfig _ = ReportOnlyClient <$> newIORef Nothing
+
+  getLogEntry _ = error "ERROR! ReportOnlyClient should not receive commits."
+
+  committed val cli = do
+    oldStored <- atomicModifyIORef' (ro_latestValue cli) (\old -> (Just val, old))
+    when (oldStored /= Just val) $ demoReportVal val
