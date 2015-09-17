@@ -38,6 +38,7 @@ import JsonStorage
 import Config
 import Debug
 import ExitCodes
+import Demo
 
 --- The strict-concurrency package is out-of-date, so we roll our own:
 
@@ -392,15 +393,15 @@ debugServInfo serv = show (view serverId serv) ++ " " ++ show (view (config.role
 
 debugMainStarting :: (Show a) => Server cl s c a -> IO ()
 debugMainStarting serv0 = do
-  putStrLn $ "===== " ++ debugServInfo serv0 ++ " STARTING ====="
-  print $ view config serv0
-  print serv0
+  debugIO $ "===== " ++ debugServInfo serv0 ++ " STARTING ====="
+  debugIO . show $ view config serv0
+  debugIO . show $ serv0
 
 debugMainFinishing :: (Show a) => Server cl s c a -> IO ()
 debugMainFinishing serv' = do
-  putStrLn $ "===== " ++ debugServInfo serv' ++ " FINISHING ====="
-  print serv'
-  putStrLn "===== ALL DONE ====="
+  debugIO $ "===== " ++ debugServInfo serv' ++ " FINISHING ====="
+  debugIO . show $ serv'
+  debugIO "===== ALL DONE ====="
 
 debugMain :: (Show a) => (Server cl s c a -> IO (Server cl s c a)) -> Server cl s c a -> IO (Server cl s c a)
 debugMain mainFn serv0 = do
@@ -718,10 +719,13 @@ leaderLoop nextMid servBox = do
 main :: IO ()
 main = do
   args <- getArgs
+
   case args of
    (myId:rest) -> do
-     let sid = fromIntegral . read $ myId
-     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig SimpleIncrementingClient JsonStorage HandleConnection String)
+
+     let sid = fromIntegral . read $ myId :: ServerId
+--     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig SimpleIncrementingClient JsonStorage HandleConnection String)
+     conf <- readJSONConfig (kConfigFile sid) sid :: IO (ServerConfig GetlineClient JsonStorage HandleConnection Int)
      serv <- fromPersist . initializeFollower $ conf
      case rest of
       ("test":_) -> testMain sid

@@ -15,11 +15,33 @@ def sys(arg_str)
   system(arg_str, out: $stdout, err: :out)
 end
 
+def interruptible
+  begin
+    yield
+  rescue Interrupt
+    puts
+  end
+end
+
 task default: %w[compile docker:compile]
 
 task :compile do
-    `mkdir -p build`
-    sys compile(:osx)
+  `mkdir -p build`
+  `mkdir -p log`
+  `rm -f log/debug.*`
+  `rm -f db/log.*`
+  sys compile(:osx)
+end
+
+task :reset do
+  `rm -f log/debug.*`
+  `rm -f db/log.*`
+end
+
+task :debug, [:server_id] do |t, args|
+  log = "log/debug.#{args[:server_id]}.log"
+  `touch #{log}`
+  interruptible { sys "clear; tail -100f #{log}" }
 end
 
 task :run, [:server_id] do |t, args|

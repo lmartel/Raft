@@ -1,19 +1,29 @@
 module Main where
 
 import Control.Concurrent
+import Data.IORef
 import System.Environment
 import System.Exit
 import System.Posix
+import System.IO
 
 import qualified Raft
+import Debug
 import ExitCodes
 
 main :: IO ()
 main = do
   args <- getArgs
   case args of
-   [myId] -> newEmptyMVar >>= \interrupted -> runAs interrupted (read myId) "follower"
+   myId:["log"] -> withArgs [myId, "log"] Raft.main
+   [myId] -> do
+     let sid = read myId :: Int
+     writeIORef debugTarget =<< openFile ("log/debug." ++ show sid ++ ".log") WriteMode
+
+     interrupted <- newEmptyMVar
+     runAs interrupted sid "follower"
    _ -> error "Invalid arguments. Expected one arg: `raft SERVER_ID`"
+
 
 announceDone :: ExitCode -> IO ()
 announceDone code = putStrLn $ "Raft Supervisor :: shutting down. Raft return status: " ++ show code

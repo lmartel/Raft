@@ -96,9 +96,9 @@ instance Show HandleConnection where
 debugConnectError :: Bool -> CohortConfig -> IOError -> IO ()
 debugConnectError verbose conf ex
   -- Connection refused.
-  | isDoesNotExistError ex                 = when verbose $ putStrLn ("Cannot connect to " ++ followerInfo)
-  | isEOFError ex                          = when verbose $ putStrLn (followerInfo ++ " finished.")
-  | ioeGetErrorType ex == ResourceVanished = when verbose $ putStrLn (followerInfo ++ " disconnected.")
+  | isDoesNotExistError ex                 = when verbose $ debugIO ("Cannot connect to " ++ followerInfo)
+  | isEOFError ex                          = when verbose $ debugIO (followerInfo ++ " finished.")
+  | ioeGetErrorType ex == ResourceVanished = when verbose $ debugIO (followerInfo ++ " disconnected.")
   | otherwise                              = error ("Unknown connection error: " ++ show ex)
   where followerInfo = "Follower " ++ show (view cohortId conf)
                        ++ " (" ++ view cohortHostname conf
@@ -109,7 +109,7 @@ connectHandle :: Bool -> CohortConfig -> IO (Maybe Handle)
 connectHandle verbose conf@(CohortConfig _ host portNum) =
   catch (do
     hdl <- connectHandle'
-    when verbose $ putStrLn ("Connected to follower at " ++ host ++ ":" ++ show portNum ++ ".")
+    when verbose $ debugIO ("Connected to follower at " ++ host ++ ":" ++ show portNum ++ ".")
     return (Just hdl)
   ) (\ex -> debugConnectError verbose conf ex >> return Nothing)
   where connectHandle' :: IO Handle

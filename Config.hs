@@ -19,10 +19,12 @@ kReconnect :: Microsec
 kReconnect = milli 100
 
 kGenerateClientUpdates :: Microsec
-kGenerateClientUpdates = milli 700
+-- kGenerateClientUpdates = milli 700
+kGenerateClientUpdates = milli 5
 
 kCommitReport :: Microsec
-kCommitReport = milli 1000
+-- kCommitReport = milli 1000
+kCommitReport = milli 50
 
 kHeartbeat :: Microsec
 kHeartbeat = milli 100
