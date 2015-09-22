@@ -71,3 +71,4 @@ rake docker:build   # build a linux image with Haskell and Raft's dependencies
 rake docker:compile # compile for Linux using docker
 rake docker:run[ID] # run server #ID on Linux inside docker
 ```
+if you're messing around with Docker you'll probably have to edit the Rakefile; there are a few Docker commands that insist on absolute paths.

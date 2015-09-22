@@ -1,6 +1,6 @@
 require 'os'
 
-mount = '/Users/leo/Dropbox/macdev/distributed_systems:/raft'
+mount = '/Users/leo/Dropbox/macdev/toy-boat:/raft'
 
 def ghc(os)
   if os == :linux then '/opt/ghc/7.10.2/bin/ghc' else 'ghc' end
