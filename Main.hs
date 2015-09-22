@@ -15,15 +15,17 @@ main :: IO ()
 main = do
   args <- getArgs
   case args of
-   myId:["log"] -> withArgs [myId, "log"] Raft.main
-   [myId] -> do
-     let sid = read myId :: Int
-     writeIORef debugTarget =<< openFile ("log/debug." ++ show sid ++ ".log") WriteMode
-
-     interrupted <- newEmptyMVar
-     runAs interrupted sid "follower"
+   myId:[arg] -> if arg `elem` ["leader", "follower", "candidate"]
+                 then main' (read myId) arg
+                 else withArgs [myId, "log"] Raft.main
+   [myId] -> main' (read myId) "follower"
    _ -> error "Invalid arguments. Expected one arg: `raft SERVER_ID`"
+  where main' :: Int -> String -> IO ()
+        main' sid role = do
+          writeIORef debugTarget =<< openFile ("log/debug." ++ show sid ++ ".log") WriteMode
 
+          interrupted <- newEmptyMVar
+          runAs interrupted sid role
 
 announceDone :: ExitCode -> IO ()
 announceDone code = putStrLn $ "Raft Supervisor :: shutting down. Raft return status: " ++ show code

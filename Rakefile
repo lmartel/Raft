@@ -25,12 +25,10 @@ end
 
 task default: %w[compile docker:compile]
 
-task :compile do
-  `mkdir -p build`
-  `mkdir -p log`
-  `rm -f log/debug.*`
-  `rm -f db/log.*`
-  sys compile(:osx)
+task :mkdirs do
+    `mkdir -p build`
+    `mkdir -p db`
+    `mkdir -p log`
 end
 
 task :reset do
@@ -38,13 +36,21 @@ task :reset do
   `rm -f db/log.*`
 end
 
-task :debug, [:server_id] do |t, args|
+task :compile => [:mkdirs, :reset] do
+  sys compile(:osx)
+end
+
+task :log, [:server_id] => :mkdirs do |t, args|
+  sys "./raft-osx #{args[:server_id]} log"
+end
+
+task :debug, [:server_id] => :mkdirs do |t, args|
   log = "log/debug.#{args[:server_id]}.log"
   `touch #{log}`
   interruptible { sys "clear; tail -100f #{log}" }
 end
 
-task :run, [:server_id] do |t, args|
+task :run, [:server_id] => :mkdirs do |t, args|
   sid = args[:server_id] || (puts "Missing arg: serverId" && exit(1))
   sys %Q[./raft-osx #{sid}]
 end
