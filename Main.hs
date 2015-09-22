@@ -17,7 +17,7 @@ main = do
   case args of
    myId:[arg] -> if arg `elem` ["leader", "follower", "candidate"]
                  then main' (read myId) arg
-                 else withArgs [myId, "log"] Raft.main
+                 else withArgs [myId, arg] Raft.main
    [myId] -> main' (read myId) "follower"
    _ -> error "Invalid arguments. Expected one arg: `raft SERVER_ID`"
   where main' :: Int -> String -> IO ()

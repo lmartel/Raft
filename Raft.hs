@@ -767,24 +767,21 @@ testMain :: ServerId -> IO ()
 testMain myId = do
   ioConfig <- writeTestConfig simpleConfig >> readTestConfig
 
-  appendLdr <- testLocalSystemWith (Log [LogEntry 1 "stardate one"]) myId
-  appendLogs <- followerLogs appendLdr
-
-  -- hbeatLdr <- testLocalSystemWith (Log []) myId
-  -- hbeatLogs <- followerLogs hbeatLdr
+  -- appendLdr <- testLocalSystemWith (Log [LogEntry 1 "stardate one"]) myId
+  -- appendLogs <- followerLogs appendLdr
 
   runTestTT . TestList $ [
         TestLabel "testConfig"
         . TestCase $ assertEqual "for write >> read config," (Just simpleConfig)
         ioConfig
-        ,
-        TestLabel "testSimpleAppendResponses"
-        . TestCase $ assertEqual ("for matchIndices @ testLocalSystem " ++ show myId ++ ",") (Just [1,1,1])
-        (liftM (map snd . Map.toList) $ view matchIndex appendLdr)
-        ,
-        TestLabel "testSimpleAppendStorage"
-        . TestCase $ assertAllEqual ("for follower logs @ testLocalSystem " ++ show myId ++ ",") (view log appendLdr)
-        appendLogs
+        -- ,
+        -- TestLabel "testSimpleAppendResponses"
+        -- . TestCase $ assertEqual ("for matchIndices @ testLocalSystem " ++ show myId ++ ",") (Just [1,1,1])
+        -- (liftM (map snd . Map.toList) $ view matchIndex appendLdr)
+        -- ,
+        -- TestLabel "testSimpleAppendStorage"
+        -- . TestCase $ assertAllEqual ("for follower logs @ testLocalSystem " ++ show myId ++ ",") (view log appendLdr)
+        -- appendLogs
         ]
 
   print "All done!"
@@ -838,8 +835,7 @@ testLocalSystemWith :: Log String -> ServerId -> IO (Server AbortClient JsonStor
 testLocalSystemWith lg myId = do
   conf <- readJSONConfig (kConfigFile myId) myId
   serv <- promoteToLeader $ initializeFollower conf
-  case view role conf of
-   Leader -> leaderMain . injectPersistentState (1, Just myId, lg) $ serv
+  leaderMain . injectPersistentState (1, Just myId, lg) $ serv
 
 
 writeTestConfig :: ClusterConfig -> IO ()
