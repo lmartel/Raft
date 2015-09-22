@@ -33,7 +33,7 @@ Here's the full usage information:
 ./raft-linux SERVER_ID [COMMAND] # commands = [log, test, leader, candidate, follower]
 
 Examples:
-./raft-osx 1           # runs a Raft instance with ID=1
+./raft-osx 1               # runs a Raft instance with ID=1
 ./raft-osx 3 candidate     # runs a Raft instance with ID=3, forcing it into a particular starting role (candidate)
 ./raft-osx 2 log           # dumps a nicely-formatted version of Server 2's write-ahead log, found in db/log.ID.json.
 ./raft-osx 1 test          # runs the tests for Server 1. The test harness has been set up, but there aren't many tests.
