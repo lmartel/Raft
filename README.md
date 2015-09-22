@@ -1,5 +1,7 @@
 # ToyBoat - A Raft implementation
 
+![ToyBoat Raft demo](raft-demo.png?raw=true)
+
 [Raft](https://raft.github.io/) is a distributed consensus algorithm. Consensus algorithms provide strong consistency guarantees to a cluster of servers, coordinating agreement on a value or safely replicating a state machine. Raft is mostly-equivalent to an earlier algorithm called Paxos, but was designed specifically to be easier to understand and leave less as an "exercise for the reader." You can read [the original paper](http://ramcloud.stanford.edu/raft.pdf) for an excellent description of the algorithm and its many uses. You can also read [any Paxos paper](http://research.microsoft.com/en-us/um/people/lamport/pubs/paxos-simple.pdf) to see why an easier and more exaustively-specified algorithm was necessary.
 
 This repo contains my own implementation of Raft, in Haskell. I've implemented the full protocol, the two big pieces being log-entry propagation and leader election. Performance was not my focus, but it's fast enough to be IO-bound (and constrained by the configurable heartbeat/election timers) rather than CPU-bound. I also skipped space optimizations like log compaction, since I'm not using this in production anywhere and the log files take a long time to get huge.
@@ -21,7 +23,7 @@ tail -100f log/debug.2.log
 tail -100f log/debug.3.log
 ```
 
-It'll look like this: ![ToyBoat Raft demo](raft-demo.png?raw=true)
+It'll look like the picture above.
 
 
 ### Running ToyBoat
